@@ -28,6 +28,7 @@ class ZedImageSubscriber(Node):
             self.download_callback,  
             10  
         )  
+        
         self.image_number = 0  
         self.last_image = None  
         self.get_logger().info('ZED RGB Image Subscriber started')  
