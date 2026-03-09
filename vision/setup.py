@@ -27,6 +27,9 @@ setup(
         'console_scripts': [
             'image_download = vision.image_download:main',
             'rgb_yolo = vision.rgb_yolo:main',
+            'yolo_3D = vision.yolo_3D:main',
+            'stereo_yolo = vision.stereo_yolo:main',
+            'z2i_pipeline = vision.z2i_pipeline:main',
             'extract_relative_pose = vision.extract_relative_pose:main',
             'detect_circle = vision.detect_circle:main',
         ],
