@@ -43,6 +43,7 @@ FORMAT JSON PUBLIÉ sur /scene_description
 
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 import numpy as np
 import open3d as o3d
@@ -56,6 +57,8 @@ from zed_msgs.msg import ObjectsStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from builtin_interfaces.msg import Duration
+
+from std_msgs.msg import Float64
 from std_msgs.msg import String
 
 
@@ -154,6 +157,8 @@ class ZEDWallDetector(Node):
         self.buf_size    = self.get_parameter('buffer_size').value
         self.sim_thresh  = self.get_parameter('plane_sim_thresh').value
         self.dist_thresh = self.get_parameter('plane_dist_thresh').value
+        self.altitude_buffer = deque(maxlen=self.buf_size)
+        self.heading_buffer  = deque(maxlen=self.buf_size)
 
         pitch    = math.radians(self.get_parameter('camera_pitch_deg').value)
         self.v_up = np.array([-math.sin(pitch), 0.0, math.cos(pitch)])
@@ -173,6 +178,18 @@ class ZEDWallDetector(Node):
             depth=10
         )
 
+        mavros_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+
+        self.create_subscription(
+            Float64,'/mavros/global_position/compass_hdg',self._heading_cb, mavros_qos)
+        self.create_subscription(
+            PoseStamped,'/mavros/local_position/pose',self._altitude_cb, mavros_qos)
         self.create_subscription(
             PointCloud2, '/zed/zed_node/point_cloud/cloud_registered', self.cloud_cb, qos)
         self.create_subscription(
@@ -197,6 +214,15 @@ class ZEDWallDetector(Node):
     def cloud_cb(self, msg):
         self.cloud_buffer.append((stamp_to_sec(msg.header.stamp), msg))
         self.cnt_cloud += 1
+
+    def _heading_cb(self, msg):
+    # compass_hdg n'a pas de header — on utilise le temps ROS courant
+        t = self.get_clock().now().nanoseconds * 1e-9
+        self.heading_buffer.append((t, msg.data))
+
+    def _altitude_cb(self, msg):
+        t = stamp_to_sec(msg.header.stamp)
+        self.altitude_buffer.append((t, msg.pose.position.z))
 
     def image_cb(self, msg):
         self.image_buffer.append((stamp_to_sec(msg.header.stamp), msg))
@@ -244,6 +270,17 @@ class ZEDWallDetector(Node):
         cloud_msg    = frame.cloud_msg
         current_time = frame.det_time
         h, w         = cloud_msg.height, cloud_msg.width
+
+        alt_val, alt_dt = find_closest(self.altitude_buffer, current_time)
+        hdg_val, hdg_dt = find_closest(self.heading_buffer,  current_time)
+
+        drone_altitude = alt_val
+        drone_heading  = hdg_val if hdg_val is not None else 0.0
+
+        if alt_dt > 0.5:
+            self.get_logger().warn(f'Altitude MAVROS désynchronisée (dt={alt_dt*1000:.0f}ms)')
+        if hdg_dt > 0.5:
+            self.get_logger().warn(f'Heading(N,S,E,W) MAVROS désynchronisé (dt={hdg_dt*1000:.0f}ms)')
 
         cloud_bytes = np.frombuffer(cloud_msg.data, dtype=np.uint8)
         dtype       = np.dtype([('x', np.float32), ('y', np.float32),
@@ -351,7 +388,14 @@ class ZEDWallDetector(Node):
             label    = data['label']
             centroid = data['centroid']
             normal   = data['model'][:3]
-            h_rel    = float(centroid[2])  # Z=Up dans REP-103
+            # Hauteur absolue = altitude drone + hauteur relative de la cible dans le repère caméra
+            if drone_altitude is not None:
+                h_abs = drone_altitude + float(centroid[2])
+                height_m = round(h_abs, 3)
+                height_source = 'absolute'
+            else:
+                height_m = round(float(centroid[2]), 3)
+                height_source = 'relative_cam'
 
             marker_array.markers.append(
                 self._make_arrow(uid, data, colors[uid], cloud_msg.header))
@@ -371,7 +415,7 @@ class ZEDWallDetector(Node):
                 self.get_logger().info(
                     f'[{label}|{uid}] → réf [{ref_data["label"]}|{ref_id}] | '
                     f'x={P[0]:+.3f}m droite, y={P[1]:+.3f}m haut | '
-                    f'h_rel={h_rel:+.3f}m'
+                    f'height_m={height_m:+.3f}m'
                 )
                 scene_targets.append({
                     'id':           uid,
@@ -383,12 +427,13 @@ class ZEDWallDetector(Node):
                         'y': round(float(P[1]), 3),
                         'z': round(float(P[2]), 3),
                     },
-                    'h_rel_cam': round(h_rel, 3),
+                    'height_m': round(height_m, 3),
+                    'height_source': height_source,
                 })
             else:
                 self.get_logger().info(
                     f'[{label}|{uid}] sans référence sur ce plan | '
-                    f'h_rel={h_rel:+.3f}m'
+                    f'height_m={height_m:+.3f}m'
                 )
                 scene_targets.append({
                     'id':           uid,
@@ -396,7 +441,8 @@ class ZEDWallDetector(Node):
                     'wall_normal':  wall_normal,
                     'reference':    None,
                     'local_coords': None,
-                    'h_rel_cam':    round(h_rel, 3),
+                    'height_m':    round(height_m, 3),
+                    'height_source': height_source,
                 })
 
         # Publication
@@ -415,6 +461,7 @@ class ZEDWallDetector(Node):
                 'timestamp': round(current_time, 4),
                 'cloud_dt':  round(frame.cloud_dt * 1000, 1),
                 'image_dt':  round(frame.image_dt * 1000, 1) if frame.image_dt else None,
+                'drone_heading':  round(drone_heading, 1),
                 'targets':   scene_targets,
             })
             self.scene_pub.publish(out)

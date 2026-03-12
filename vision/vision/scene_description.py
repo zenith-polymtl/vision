@@ -107,7 +107,7 @@ def _describe_target(target: dict, heading_deg: float) -> str:
        Height relative to camera: Z.Zm above/below the camera."
     """
     label     = target['label']
-    h_rel     = target['h_rel_cam']
+    h         = target.get('height_m', 0.0)
     reference = target['reference']
     coords    = target['local_coords']
     normal    = target.get('wall_normal')
@@ -129,9 +129,10 @@ def _describe_target(target: dict, heading_deg: float) -> str:
     else:
         face_desc = 'the structure (face undetermined)'
 
-    h_dm  = _round_dm(abs(h_rel))
-    h_dir = 'above' if h_rel >= 0 else 'below'
-    height_str = f'{h_dm}m {h_dir} the camera'
+    source = target.get('height_source', 'relative_cam')
+    h_dir = 'above' if h >= 0 else 'below'
+    ref_point = 'ground' if source == 'absolute' else 'the camera'
+    height_str = f'{abs(round(h, 1))}m {h_dir} {ref_point}'
 
     # ── CAS 1 : référence trouvée ──────────────────────────────────────────
     if reference is not None and coords is not None:
@@ -161,14 +162,14 @@ def _describe_target(target: dict, heading_deg: float) -> str:
             f'Target (color: {color}): located on {face_desc}. '
             f'{horiz.capitalize()}. '
             f'{vert.capitalize()}. '
-            f'Height relative to camera: {height_str}.'
+            f'Height: {height_str}.'
         )
 
     # ── CAS 2 : sans référence ─────────────────────────────────────────────
     return (
         f'Target (color: {color}): located on {face_desc}. '
         f'No landmark reference found on this wall face. '
-        f'Height relative to camera: {height_str}.'
+        f'Height: {height_str}.'
     )
 
 
@@ -207,6 +208,7 @@ class SceneDescriptorNode(Node):
 
         targets   = data.get('targets', [])
         timestamp = data.get('timestamp', 0.0)
+        heading = data.get('drone_heading', self.heading)
 
         if not targets:
             return
@@ -214,7 +216,7 @@ class SceneDescriptorNode(Node):
         lines = [f'=== Target Localization Report (t={timestamp:.2f}s) ===']
 
         for i, target in enumerate(targets):
-            desc = _describe_target(target, self.heading)
+            desc = _describe_target(target, heading)
             lines.append(f'\n[Target {i + 1}]')
             lines.append(desc)
             self.get_logger().info(f'[Target {i+1}] {desc}')
