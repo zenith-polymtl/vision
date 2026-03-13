@@ -65,7 +65,7 @@ from std_msgs.msg import String
 REFERENCE_LABELS = {'window', 'door', 'fenetre', 'porte'}
 TARGET_LABELS    = {'person', 'target', 'cible',
                     'red_target', 'blue_target', 'green_target',
-                    'yellow_target', 'orange_target'}
+                    'yellow_target', 'orange_target', 'red_circle', 'blue_circle', 'green_circle', 'yellow_circle', 'circle_red', 'circle_blue', 'circle_green', 'circle_yellow'}
 
 
 # ── FONCTIONS PURES ────────────────────────────────────────────────────────────
@@ -147,6 +147,9 @@ class ZEDWallDetector(Node):
         self.declare_parameter('camera_pitch_deg',  0.0)
         self.declare_parameter('plane_sim_thresh',  0.85)
         self.declare_parameter('plane_dist_thresh', 0.35)
+        self.declare_parameter('image_width',  1280)
+        self.declare_parameter('image_height', 720)
+
 
         self.rans_dist   = self.get_parameter('ransac_dist').value
         self.rans_iter   = self.get_parameter('ransac_iterations').value
@@ -159,6 +162,8 @@ class ZEDWallDetector(Node):
         self.dist_thresh = self.get_parameter('plane_dist_thresh').value
         self.altitude_buffer = deque(maxlen=self.buf_size)
         self.heading_buffer  = deque(maxlen=self.buf_size)
+        self.img_w = self.get_parameter('image_width').value
+        self.img_h = self.get_parameter('image_height').value
 
         pitch    = math.radians(self.get_parameter('camera_pitch_deg').value)
         self.v_up = np.array([-math.sin(pitch), 0.0, math.cos(pitch)])
@@ -195,7 +200,7 @@ class ZEDWallDetector(Node):
         self.create_subscription(
             Image, '/zed/zed_node/rgb/color/rect/image', self.image_cb, qos)
         self.create_subscription(
-            ObjectsStamped, '/aeac/test/objects', self.obj_cb, qos)
+            ObjectsStamped, '/zed/zed_node/obj_det/objects', self.obj_cb, qos)
 
         self.marker_pub = self.create_publisher(MarkerArray, '/detected_walls',    10)
         self.scene_pub  = self.create_publisher(String,      '/scene_description', 10)
@@ -274,6 +279,8 @@ class ZEDWallDetector(Node):
         alt_val, alt_dt = find_closest(self.altitude_buffer, current_time)
         hdg_val, hdg_dt = find_closest(self.heading_buffer,  current_time)
 
+        scale_u = w / self.img_w
+        scale_v = h / self.img_h
         drone_altitude = alt_val
         drone_heading  = hdg_val if hdg_val is not None else 0.0
 
@@ -295,8 +302,8 @@ class ZEDWallDetector(Node):
             label = obj.label
 
             corners = obj.bounding_box_2d.corners
-            us = [c.kp[0] for c in corners]
-            vs = [c.kp[1] for c in corners]
+            us = [c.kp[0] * scale_u for c in corners]
+            vs = [c.kp[1] * scale_v for c in corners]
             u_min, u_max = min(us), max(us)
             v_min, v_max = min(vs), max(vs)
             bw, bh = u_max - u_min, v_max - v_min
