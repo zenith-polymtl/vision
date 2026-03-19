@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-scene_descriptor.py — Génération de descriptions en langage naturel des cibles
+scene_descripton.py — Génération de descriptions en langage naturel des cibles
 
 PRINCIPE
 ────────
-Subscribe à /scene_description (JSON de wall_detector).
+Subscribe à /aeac/internal/scene_description (JSON de wall_detector).
 Pour chaque frame, génère une description textuelle en anglais pour chaque cible.
 
 ORIENTATION
@@ -23,10 +23,6 @@ COORDONNÉES LOCALES (quand référence disponible)
   y < 0 = en dessous de la référence
   (z = profondeur, non utilisé pour la description)
 
-TOPICS
-──────
-  Subscribe : /scene_description  (std_msgs/String JSON)
-  Publish   : /scene_text         (std_msgs/String texte naturel)
 
 LANCEMENT
 ─────────
@@ -189,14 +185,14 @@ class SceneDescriptorNode(Node):
             depth=10
         )
 
-        self.create_subscription(String, '/scene_description', self._scene_cb, qos)
-        self.pub = self.create_publisher(String, '/scene_text', 10)
+        self.create_subscription(String, '/aeac/internal/scene_description', self._scene_cb, qos)
+        self.pub = self.create_publisher(String, '/aeac/internal/scene_text', 10)
 
         self.get_logger().info(
             f'SceneDescriptor démarré\n'
             f'  drone_heading={self.heading}° (0=Nord, 90=Est, 180=Sud, 270=Ouest)\n'
-            f'  Subscribe : /scene_description\n'
-            f'  Publish   : /scene_text'
+            f'  Subscribe : /aeac/internal/scene_description\n'
+            f'  Publish   : /aeac/internal/scene_text'
         )
 
     def _scene_cb(self, msg: String):

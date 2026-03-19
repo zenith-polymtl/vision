@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-wall_detector.py — Détection de murs + construction de référentiels locaux
+
 
 ARCHITECTURE
 ────────────
@@ -46,7 +46,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 import numpy as np
-import open3d as o3d
+import pyransac3d as pyrsc
 import gc
 import json
 import math
@@ -134,7 +134,7 @@ class SceneFrame:
 
 class ZEDWallDetector(Node):
     def __init__(self):
-        super().__init__('wall_detector_node')
+        super().__init__('system_transformation_node')
 
         # ── PARAMÈTRES ────────────────────────────────────────────────────────
         self.declare_parameter('ransac_dist',       0.03)
@@ -147,8 +147,9 @@ class ZEDWallDetector(Node):
         self.declare_parameter('camera_pitch_deg',  0.0)
         self.declare_parameter('plane_sim_thresh',  0.85)
         self.declare_parameter('plane_dist_thresh', 0.35)
-        self.declare_parameter('image_width',  1280)
-        self.declare_parameter('image_height', 720)
+        self.declare_parameter('image_width',  448) #1280
+        self.declare_parameter('image_height', 256) #720
+        self.declare_parameter('objects_topic', '/aeac/test/objects')
 
 
         self.rans_dist   = self.get_parameter('ransac_dist').value
@@ -164,6 +165,7 @@ class ZEDWallDetector(Node):
         self.heading_buffer  = deque(maxlen=self.buf_size)
         self.img_w = self.get_parameter('image_width').value
         self.img_h = self.get_parameter('image_height').value
+        objects_topic = self.get_parameter('objects_topic').value
 
         pitch    = math.radians(self.get_parameter('camera_pitch_deg').value)
         self.v_up = np.array([-math.sin(pitch), 0.0, math.cos(pitch)])
@@ -200,15 +202,17 @@ class ZEDWallDetector(Node):
         self.create_subscription(
             Image, '/zed/zed_node/rgb/color/rect/image', self.image_cb, qos)
         self.create_subscription(
-            ObjectsStamped, '/zed/zed_node/obj_det/objects', self.obj_cb, qos)
+            ObjectsStamped, objects_topic, self.obj_cb, qos)
+        self.get_logger().info(f'Objects topic : {objects_topic}')
 
-        self.marker_pub = self.create_publisher(MarkerArray, '/detected_walls',    10)
-        self.scene_pub  = self.create_publisher(String,      '/scene_description', 10)
+#/zed/zed_node/obj_det/objects
+        self.marker_pub = self.create_publisher(MarkerArray, 'aeac/internal/detected_walls',    10)
+        self.scene_pub  = self.create_publisher(String,      'aeac/internal/scene_description', 10)
 
         self.create_timer(5.0, self._log_stats)
 
         self.get_logger().info(
-            f'WallDetector démarré\n'
+            f'SystemTransformation démarré\n'
             f'  v_up={self.v_up.round(3).tolist()} '
             f'(pitch={self.get_parameter("camera_pitch_deg").value}°)\n'
             f'  sim_thresh={self.sim_thresh}  dist_thresh={self.dist_thresh}m'
@@ -289,6 +293,7 @@ class ZEDWallDetector(Node):
         if hdg_dt > 0.5:
             self.get_logger().warn(f'Heading(N,S,E,W) MAVROS désynchronisé (dt={hdg_dt*1000:.0f}ms)')
 
+        image_stamp_sec = (stamp_to_sec(frame.image_msg.header.stamp) if frame.image_msg is not None else None)
         cloud_bytes = np.frombuffer(cloud_msg.data, dtype=np.uint8)
         dtype       = np.dtype([('x', np.float32), ('y', np.float32),
                                  ('z', np.float32), ('rgb', np.float32)])
@@ -328,9 +333,8 @@ class ZEDWallDetector(Node):
                     f'[{label}] SKIP — {len(pts)} points valides (< 100)')
                 continue
 
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts)
-            model, inliers = pcd.segment_plane(self.rans_dist, 3, self.rans_iter)
+            plane = pyrsc.Plane()
+            model, inliers = plane.fit(pts, thresh=self.rans_dist, maxIteration=self.rans_iter)
 
             ratio = len(inliers) / len(pts)
             if ratio < self.min_inliers:
@@ -465,17 +469,19 @@ class ZEDWallDetector(Node):
         if scene_targets:
             out      = String()
             out.data = json.dumps({
-                'timestamp': round(current_time, 4),
-                'cloud_dt':  round(frame.cloud_dt * 1000, 1),
-                'image_dt':  round(frame.image_dt * 1000, 1) if frame.image_dt else None,
-                'drone_heading':  round(drone_heading, 1),
-                'targets':   scene_targets,
+                'timestamp':   round(current_time, 4),
+                'image_stamp': round(image_stamp_sec, 6) if image_stamp_sec else None,
+                'cloud_dt':    round(frame.cloud_dt * 1000, 1),
+                'image_dt':    round(frame.image_dt * 1000, 1) if frame.image_dt else None,
+                'drone_heading': round(drone_heading, 1),
+                'targets':     scene_targets,
             })
             self.scene_pub.publish(out)
             self.get_logger().info(
-                f'/scene_description → {len(scene_targets)} cible(s)')
+                f'/aeac/internal/scene_description → {len(scene_targets)} cible(s)')
 
         gc.collect()
+
 
     # ── UTILITAIRES ───────────────────────────────────────────────────────────
 
