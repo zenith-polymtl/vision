@@ -64,7 +64,7 @@ from std_msgs.msg import String
 
 REFERENCE_LABELS = {'window', 'door', 'fenetre', 'porte'}
 TARGET_LABELS    = {'person', 'target', 'cible',
-                    'red_target', 'blue_target', 'green_target',
+                    'red target', 'blue target', 'greentarget',
                     'yellow target', 'orange target', 'red circle', 'blue circle', 'green circle', 'yellow circle', 'circle_red', 'circle_blue', 'circle_green', 'circle_yellow'}
 
 

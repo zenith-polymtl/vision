@@ -85,22 +85,20 @@ def _round_dm(v: float) -> float:
     """Arrondit au décimètre (1 décimale)."""
     return round(v, 1)
 
-
-# ── GÉNÉRATION DE DESCRIPTION ──────────────────────────────────────────────────
-
 def _describe_target(target: dict, heading_deg: float) -> str:
     """
-    Génère la description complète d'une cible en anglais.
+    Génère une description en langage naturel, claire et non ambiguë.
 
-    Cas 1 — référence disponible (même plan que fenêtre/porte) :
-      "Target (color: red): located on the north face of the structure.
-       X.Xm to the right of the window (when facing the wall from outside).
-       Y.Ym above the window.
-       Height relative to camera: Z.Zm above the camera."
+    Cas 1 — avec référence :
+      "The blue target is located on the north face of the structure,
+       1.3m to the right of the door when facing the wall from outside,
+       at the same height as the door.
+       It is 0.9m above the camera."
 
     Cas 2 — sans référence :
-      "Target (color: red): no landmark reference found on this wall face.
-       Height relative to camera: Z.Zm above/below the camera."
+      "The yellow target is located on the north face of the structure.
+       No landmark reference was found on this wall face.
+       It is 1.1m above the camera."
     """
     label     = target['label']
     h         = target.get('height_m', 0.0)
@@ -108,46 +106,55 @@ def _describe_target(target: dict, heading_deg: float) -> str:
     coords    = target['local_coords']
     normal    = target.get('wall_normal')
 
-    # Extraction de la couleur depuis le label
-    # ex: 'red_target' → 'red', 'target' → 'unspecified color'
-    parts = label.lower().replace('-', '_').split('_')
-    if len(parts) >= 2 and parts[-1] == 'target':
-        color = ' '.join(parts[:-1])
-    elif label.lower() != 'target':
-        color = label.lower()
+    # ── Couleur / nom de la cible ──────────────────────────────────────────
+    # 'red_target'    → 'red target'
+    # 'blue target'   → 'blue target'
+    # 'target'        → 'target'
+    # 'circle_red'    → 'red circle'
+    lo = label.lower().replace('-', '_')
+    if lo.endswith('_target'):
+        color_name = lo[:-7].replace('_', ' ').strip()
+        target_name = f'{color_name} target' if color_name else 'target'
+    elif lo.startswith('circle_'):
+        color_name = lo[7:].replace('_', ' ').strip()
+        target_name = f'{color_name} circle' if color_name else 'circle'
+    elif lo.endswith('_circle'):
+        color_name = lo[:-7].replace('_', ' ').strip()
+        target_name = f'{color_name} circle' if color_name else 'circle'
     else:
-        color = 'unspecified color'
+        target_name = lo.replace('_', ' ')
 
-    # Face du mur
+    # ── Face du mur ───────────────────────────────────────────────────────
     if normal and len(normal) >= 2:
         face = _wall_face_cardinal(normal, heading_deg)
         face_desc = f'the {face} face of the structure'
     else:
-        face_desc = 'the structure (face undetermined)'
+        face_desc = 'the structure (wall face undetermined)'
 
-    source = target.get('height_source', 'relative_cam')
-    h_dir = 'above' if h >= 0 else 'below'
-    ref_point = 'ground' if source == 'absolute' else 'the camera'
-    height_str = f'{abs(round(h, 1))}m {h_dir} {ref_point}'
+    # ── Hauteur ───────────────────────────────────────────────────────────
+    source    = target.get('height_source', 'relative_cam')
+    h_abs     = abs(round(h, 1))
+    h_dir     = 'above' if h >= 0 else 'below'
+    ref_point = 'the ground' if source == 'absolute' else 'the camera'
+    height_str = f'{h_abs}m {h_dir} {ref_point}'
 
     # ── CAS 1 : référence trouvée ──────────────────────────────────────────
     if reference is not None and coords is not None:
         ref_name = reference['label'].replace('_', ' ')
         x = coords['x']
         y = coords['y']
-
         x_dm = _round_dm(abs(x))
         y_dm = _round_dm(abs(y))
 
-        # Position horizontale sur le mur
+        # Position horizontale
         if x_dm < 0.1:
-            horiz = f'directly in front of the {ref_name}'
+            horiz = f'directly aligned with the {ref_name}'
         else:
-            h_side = 'right' if x >= 0 else 'left'
-            horiz  = (f'{x_dm}m to the {h_side} of the {ref_name}'
-                      f' (when facing the wall from outside)')
+            side  = 'right' if x >= 0 else 'left'
+            horiz = (f'{x_dm}m to the {side} of the {ref_name}'
+                     f' when facing the wall from outside')
 
-        # Position verticale par rapport à la référence
+        # Position verticale
         if y_dm < 0.1:
             vert = f'at the same height as the {ref_name}'
         else:
@@ -155,17 +162,17 @@ def _describe_target(target: dict, heading_deg: float) -> str:
             vert  = f'{y_dm}m {v_dir} the {ref_name}'
 
         return (
-            f'Target (color: {color}): located on {face_desc}. '
-            f'{horiz.capitalize()}. '
-            f'{vert.capitalize()}. '
-            f'Height: {height_str}.'
+            f'The {target_name} is located on {face_desc}, '
+            f'{horiz}, '
+            f'{vert}. '
+            f'It is {height_str}.'
         )
 
     # ── CAS 2 : sans référence ─────────────────────────────────────────────
     return (
-        f'Target (color: {color}): located on {face_desc}. '
-        f'No landmark reference found on this wall face. '
-        f'Height: {height_str}.'
+        f'The {target_name} is located on {face_desc}. '
+        f'No landmark reference was found on this wall face. '
+        f'It is {height_str}.'
     )
 
 
