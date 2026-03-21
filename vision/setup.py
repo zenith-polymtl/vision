@@ -32,6 +32,8 @@ setup(
             'z2i_pipeline = vision.z2i_pipeline:main',
             'extract_relative_pose = vision.extract_relative_pose:main',
             'detect_circle = vision.detect_circle:main',
+            'image_overlay = vision.image_overlay:main',
+            'ransac_detector = vision.ransac_detector:main',
         ],
     },
 )
