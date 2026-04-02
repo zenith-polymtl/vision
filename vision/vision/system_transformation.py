@@ -1,70 +1,32 @@
 #!/usr/bin/env python3
 """
 system_transformation.py — Détection de murs + construction de référentiels locaux
+VERSION HARDWARE JETSON — optimisée pour latence < 200ms
 
-ARCHITECTURE
-────────────
-Chaque SceneFrame est traité de façon complètement indépendante.
-frame_planes contient UNIQUEMENT les plans détectés dans cette frame.
-self.plane_memory est utilisé UNIQUEMENT pour la visualisation RViz.
+CHANGEMENTS vs version rosbag
+──────────────────────────────
+  1. MultiThreadedExecutor + ReentrantCallbackGroup pour les buffers
+     → Les callbacks cloud/image/objects tournent en parallèle du RANSAC
+  2. Buffers cloud/image réduits à maxlen=3 (on veut le PRÉSENT, pas l'histoire)
+     → Élimine cloud_dt de 3-4s causé par des données périmées dans un grand buffer
+  3. Rate limiter dans obj_cb : min 0.4s entre deux traitements (≈2.5 FPS)
+     → Évite la saturation CPU, le RANSAC finit avant la prochaine détection
+  4. Stride adaptatif agressif : vise max 500 points par objet
+     → Sur Jetson, 500 pts RANSAC ≈ 30ms vs 5000 pts ≈ 300ms
+  5. ransac_iterations défaut abaissé à 80 (suffisant pour des murs plats)
+  6. sync_tolerance élargie à 3.0s par défaut pour le hardware
 
 REPÈRE CAMÉRA (ZED ROS2 wrapper, REP-103)
 ──────────────────────────────────────────
   X = Forward  (devant la caméra)
   Y = Left     (gauche)
   Z = Up       (haut)
-
-VECTEUR UP
-──────────
-  Caméra à plat (rosbag/test) : camera_pitch_deg=0  → V_UP = [0, 0, 1]
-  Caméra à 45° vers le bas    : camera_pitch_deg=45 → V_UP = [-0.707, 0, 0.707]
-
-DÉTECTION SOL VS MUR
-─────────────────────
-  La normale RANSAC de chaque plan est analysée :
-    |nz| > 0.7  →  plan quasi-horizontal → 'floor' (sol ou plafond)
-    |nz| ≤ 0.7  →  plan quasi-vertical   → 'wall'
-  nz = composante Z de la normale (Z=Up dans REP-103)
-
-FORMAT JSON PUBLIÉ sur /aeac/internal/scene_description
-────────────────────────────────────────────────────────
-{
-  "timestamp":     float,
-  "image_stamp":   float | null,
-  "cloud_dt":      float (ms),
-  "image_dt":      float (ms) | null,
-  "drone_heading": float,
-  "targets": [
-    {
-      "id":           int,
-      "label":        str,
-      "surface":      "wall" | "floor",
-      "wall_normal":  [nx, ny, nz],
-
-      Cible sur mur (surface="wall") :
-      "reference":    {"id": int, "label": str} | null,
-      "local_coords": {"x": float,   ← droite sur le mur  (+ = droite)
-                       "y": float,   ← haut sur le mur    (+ = haut)
-                       "z": float}   ← profondeur (bruit)
-                    | null,
-
-      Cible au sol (surface="floor") :
-      "reference":    {"id": int, "label": str} | null,
-      "local_coords": {"x":         float,  ← latéral le long du mur (+ = droite)
-                       "y":         float,  ← Δ hauteur (quasi-nul, non utilisé)
-                       "z":         float,  ← distance perpendiculaire au mur
-                       "dist_wall": float}  ← alias de z, toujours positif
-                    | null,
-
-      "height_m":     float,
-      "height_source": "absolute" | "relative_cam"
-    }
-  ]
-}
 """
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import (QoSProfile, QoSReliabilityPolicy,
                         QoSHistoryPolicy, QoSDurabilityPolicy)
@@ -84,7 +46,6 @@ from std_msgs.msg import Float64, String
 
 
 # ── LABELS ────────────────────────────────────────────────────────────────────
-# Normalisation : tout en minuscules avec underscores pour la comparaison
 
 REFERENCE_LABELS = {'window', 'door', 'fenetre', 'porte'}
 
@@ -99,7 +60,6 @@ TARGET_LABELS = {
     'circle_red', 'circle_blue', 'circle_green', 'circle_yellow',
 }
 
-# Seuil de détection sol : |nz| > FLOOR_NZ_THRESH → plan horizontal
 FLOOR_NZ_THRESH = 0.7
 
 
@@ -123,12 +83,6 @@ def find_closest(buffer: deque, target_time: float):
 
 
 def build_local_frame(normal: np.ndarray, v_up: np.ndarray) -> np.ndarray:
-    """
-    Construit R (3×3) dont les colonnes sont [X_local, Y_local, Z_local] :
-      Z_local = normale (vers la caméra)
-      Y_local = projection de v_up sur le plan ("haut" sur le mur)
-      X_local = Y_local × Z_local ("droite" sur le mur)
-    """
     z_loc  = normal
     y_loc  = v_up - np.dot(v_up, z_loc) * z_loc
     norm_y = np.linalg.norm(y_loc)
@@ -149,18 +103,12 @@ def to_local_coords(R: np.ndarray, origin: np.ndarray,
 
 def is_same_plane(m1: np.ndarray, m2: np.ndarray,
                   sim_thresh: float, dist_thresh: float) -> bool:
-    """
-    Retourne True si deux plans (normalisés) sont coplanaires.
-    sim  = |dot(n1, n2)| > sim_thresh   (normales quasi-parallèles)
-    dist = |d1 - d2|     < dist_thresh  (plans quasi-confondus)
-    """
     sim  = float(np.abs(np.dot(m1[:3], m2[:3])))
     dist = float(np.abs(m1[3] - m2[3]))
     return sim > sim_thresh and dist < dist_thresh
 
 
 def normalize_label(label: str) -> str:
-    """Normalise un label pour la comparaison avec les sets de labels."""
     return label.lower().replace('-', '_')
 
 
@@ -201,74 +149,95 @@ class ZEDWallDetector(Node):
 
         # ── Paramètres ────────────────────────────────────────────────────
         self.declare_parameter('ransac_dist',        0.03)
-        self.declare_parameter('ransac_iterations',  150)
-        self.declare_parameter('min_inlier_ratio',   0.50)
-        self.declare_parameter('padding_ratio',      0.20)
-        self.declare_parameter('sync_tolerance',     1.50)
+        self.declare_parameter('ransac_iterations',  80)    # ← 150→80 pour Jetson
+        self.declare_parameter('min_inlier_ratio',   0.40)  # ← 0.50→0.40 plus souple
+        self.declare_parameter('padding_ratio',      0.10)  # ← 0.20→0.10 ROI plus petite
+        self.declare_parameter('sync_tolerance',     3.00)  # ← 1.5→3.0 pour hardware
         self.declare_parameter('image_tolerance',    5.00)
-        self.declare_parameter('buffer_size',        60)
+        self.declare_parameter('buffer_size',        60)    # buffer overlay inchangé
         self.declare_parameter('camera_pitch_deg',   0.0)
         self.declare_parameter('plane_sim_thresh',   0.85)
         self.declare_parameter('plane_dist_thresh',  0.35)
-        self.declare_parameter('image_width',        448)
-        self.declare_parameter('image_height',       256)
+        self.declare_parameter('image_width',        640)   # ← défaut hardware 640×360
+        self.declare_parameter('image_height',       360)
         self.declare_parameter('objects_topic',      '/aeac/test/objects')
+        self.declare_parameter('min_proc_interval',  0.4)   # ← NOUVEAU : rate limiter
 
-        self.rans_dist   = self.get_parameter('ransac_dist').value
-        self.rans_iter   = self.get_parameter('ransac_iterations').value
-        self.min_inliers = self.get_parameter('min_inlier_ratio').value
-        self.padding     = self.get_parameter('padding_ratio').value
-        self.sync_tol    = self.get_parameter('sync_tolerance').value
-        self.img_tol     = self.get_parameter('image_tolerance').value
-        self.buf_size    = self.get_parameter('buffer_size').value
-        self.sim_thresh  = self.get_parameter('plane_sim_thresh').value
-        self.dist_thresh = self.get_parameter('plane_dist_thresh').value
-        self.img_w       = self.get_parameter('image_width').value
-        self.img_h       = self.get_parameter('image_height').value
-        objects_topic    = self.get_parameter('objects_topic').value
+        self.rans_dist        = self.get_parameter('ransac_dist').value
+        self.rans_iter        = self.get_parameter('ransac_iterations').value
+        self.min_inliers      = self.get_parameter('min_inlier_ratio').value
+        self.padding          = self.get_parameter('padding_ratio').value
+        self.sync_tol         = self.get_parameter('sync_tolerance').value
+        self.img_tol          = self.get_parameter('image_tolerance').value
+        self.buf_size         = self.get_parameter('buffer_size').value
+        self.sim_thresh       = self.get_parameter('plane_sim_thresh').value
+        self.dist_thresh      = self.get_parameter('plane_dist_thresh').value
+        self.img_w            = self.get_parameter('image_width').value
+        self.img_h            = self.get_parameter('image_height').value
+        objects_topic         = self.get_parameter('objects_topic').value
+        self.min_proc_interval= self.get_parameter('min_proc_interval').value
 
         pitch     = math.radians(self.get_parameter('camera_pitch_deg').value)
         self.v_up = np.array([-math.sin(pitch), 0.0, math.cos(pitch)])
 
         # ── État ──────────────────────────────────────────────────────────
-        self.cloud_buffer    = deque(maxlen=self.buf_size)
-        self.image_buffer    = deque(maxlen=self.buf_size)
-        self.altitude_buffer = deque(maxlen=self.buf_size)
-        self.heading_buffer  = deque(maxlen=self.buf_size)
-        self.plane_memory    = {}   # RViz uniquement
+        # CRITIQUE : buffers cloud/image = 3 seulement → on garde uniquement le PRÉSENT
+        # Un grand buffer (60+) garantit des cloud_dt élevés car le RANSAC
+        # ne vide pas le buffer, il choisit le message le plus proche qui date
+        # déjà de plusieurs secondes quand le CPU est surchargé.
+        self.cloud_buffer    = deque(maxlen=3)   # ← WAS self.buf_size
+        self.image_buffer    = deque(maxlen=3)   # ← WAS self.buf_size
+        self.altitude_buffer = deque(maxlen=10)
+        self.heading_buffer  = deque(maxlen=10)
+        self.plane_memory    = {}
         self.is_processing   = False
+        self.last_proc_time  = 0.0               # ← NOUVEAU : rate limiter
         self.cnt_cloud = self.cnt_image = self.cnt_obj = self.cnt_frames = 0
+
+        # ── Callback groups ───────────────────────────────────────────────
+        # Les callbacks de buffer tournent en parallèle du RANSAC (Reentrant)
+        # Le callback de traitement est exclusif (MutuallyExclusive)
+        self.buf_group  = ReentrantCallbackGroup()
+        self.proc_group = MutuallyExclusiveCallbackGroup()
 
         # ── QoS ───────────────────────────────────────────────────────────
         qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=5   # ← réduit de 10→5, on ne veut pas de file d'attente
         )
         mavros_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=5
         )
 
         # ── Subscriptions ─────────────────────────────────────────────────
+        # Buffers → ReentrantCallbackGroup : tournent même pendant RANSAC
         self.create_subscription(
             Float64, '/mavros/global_position/compass_hdg',
-            self._heading_cb, mavros_qos)
+            self._heading_cb, mavros_qos,
+            callback_group=self.buf_group)
         self.create_subscription(
             PoseStamped, '/mavros/local_position/pose',
-            self._altitude_cb, mavros_qos)
+            self._altitude_cb, mavros_qos,
+            callback_group=self.buf_group)
         self.create_subscription(
             PointCloud2, '/zed/zed_node/point_cloud/cloud_registered',
-            self.cloud_cb, qos)
+            self.cloud_cb, qos,
+            callback_group=self.buf_group)
         self.create_subscription(
             Image, '/zed/zed_node/rgb/color/rect/image',
-            self.image_cb, qos)
+            self.image_cb, qos,
+            callback_group=self.buf_group)
+
+        # Traitement → MutuallyExclusiveCallbackGroup : le RANSAC est exclusif
         self.create_subscription(
             ObjectsStamped, objects_topic,
-            self.obj_cb, qos)
+            self.obj_cb, qos,
+            callback_group=self.proc_group)
 
         # ── Publishers ────────────────────────────────────────────────────
         self.marker_pub = self.create_publisher(
@@ -276,19 +245,24 @@ class ZEDWallDetector(Node):
         self.scene_pub = self.create_publisher(
             String, 'aeac/internal/scene_description', 10)
 
-        self.create_timer(5.0, self._log_stats)
+        self.create_timer(5.0, self._log_stats,
+                          callback_group=self.buf_group)
 
         self.get_logger().info(
-            f'SystemTransformation démarré\n'
+            f'SystemTransformation démarré (mode HARDWARE)\n'
             f'  objects_topic={objects_topic}\n'
             f'  v_up={self.v_up.round(3).tolist()} '
             f'(pitch={self.get_parameter("camera_pitch_deg").value}°)\n'
+            f'  bbox_ref={self.img_w}×{self.img_h}\n'
+            f'  ransac_iter={self.rans_iter}  min_inliers={self.min_inliers}\n'
+            f'  sync_tol={self.sync_tol}s  min_proc_interval={self.min_proc_interval}s\n'
+            f'  cloud_buffer=3  image_buffer=3  (mode présent)\n'
             f'  sim_thresh={self.sim_thresh}  '
             f'dist_thresh={self.dist_thresh}m  '
             f'floor_nz_thresh={FLOOR_NZ_THRESH}'
         )
 
-    # ── Buffers ───────────────────────────────────────────────────────────────
+    # ── Buffers (ReentrantCallbackGroup — tournent pendant RANSAC) ────────────
 
     def cloud_cb(self, msg):
         self.cloud_buffer.append((stamp_to_sec(msg.header.stamp), msg))
@@ -299,7 +273,6 @@ class ZEDWallDetector(Node):
         self.cnt_image += 1
 
     def _heading_cb(self, msg):
-        # compass_hdg n'a pas de header — on utilise le temps ROS courant
         t = self.get_clock().now().nanoseconds * 1e-9
         self.heading_buffer.append((t, msg.data))
 
@@ -310,14 +283,23 @@ class ZEDWallDetector(Node):
     def _log_stats(self):
         self.get_logger().info(
             f'[STATS 5s] cloud:{self.cnt_cloud} img:{self.cnt_image} '
-            f'obj:{self.cnt_obj} frames:{self.cnt_frames}'
+            f'obj:{self.cnt_obj} frames:{self.cnt_frames} '
+            f'cloud_buf:{len(self.cloud_buffer)} img_buf:{len(self.image_buffer)}'
         )
         self.cnt_cloud = self.cnt_image = self.cnt_obj = self.cnt_frames = 0
 
-    # ── Déclencheur ───────────────────────────────────────────────────────────
+    # ── Déclencheur (MutuallyExclusiveCallbackGroup) ──────────────────────────
 
     def obj_cb(self, msg):
         self.cnt_obj += 1
+
+        # ── Rate limiter ──────────────────────────────────────────────────
+        # Sur Jetson, on limite le traitement à ~2.5 FPS pour que le RANSAC
+        # finisse avant la prochaine détection et que les buffers restent frais.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if (now - self.last_proc_time) < self.min_proc_interval:
+            return
+
         if self.is_processing:
             return
 
@@ -326,7 +308,8 @@ class ZEDWallDetector(Node):
         cloud_msg, cloud_dt = find_closest(self.cloud_buffer, det_time)
         if cloud_msg is None or cloud_dt > self.sync_tol:
             self.get_logger().warn(
-                f'Cloud absent ou trop loin (dt={cloud_dt * 1000:.0f}ms)')
+                f'Cloud absent ou trop loin (dt={cloud_dt * 1000:.0f}ms) '
+                f'— buf_size={len(self.cloud_buffer)}')
             return
 
         image_msg, image_dt = find_closest(self.image_buffer, det_time)
@@ -338,6 +321,7 @@ class ZEDWallDetector(Node):
         try:
             self._process_frame(frame)
             self.cnt_frames += 1
+            self.last_proc_time = now  # ← marquer seulement si succès
         except Exception as e:
             self.get_logger().error(f'Erreur _process_frame: {e}')
         finally:
@@ -365,7 +349,6 @@ class ZEDWallDetector(Node):
             self.get_logger().warn(
                 f'Heading MAVROS désynchronisé (dt={hdg_dt * 1000:.0f}ms)')
 
-        # Timestamp de l'image utilisée (pour sync overlay_node)
         image_stamp_sec = (
             stamp_to_sec(frame.image_msg.header.stamp)
             if frame.image_msg is not None else None
@@ -386,7 +369,6 @@ class ZEDWallDetector(Node):
             uid   = int(getattr(obj, 'label_id', 0) + idx * 100)
             label = obj.label
 
-            # Coordonnées bbox → coordonnées cloud
             corners = obj.bounding_box_2d.corners
             us = [c.kp[0] * scale_u for c in corners]
             vs = [c.kp[1] * scale_v for c in corners]
@@ -405,9 +387,11 @@ class ZEDWallDetector(Node):
                     f'[{label}] ROI invalide — bbox hors du cloud {w}×{h}')
                 continue
 
-            # Stride adaptatif pour limiter la RAM sur Jetson
+            # ── Stride agressif : vise max ~500 points ────────────────────
+            # Sur Jetson, chaque point supplémentaire coûte cher au RANSAC Python.
+            # 500 pts bien répartis suffisent pour détecter un mur plat.
             area   = (v1 - v0) * (u1 - u0)
-            stride = 3 if area > 10_000 else (2 if area > 2_500 else 1)
+            stride = max(1, int(math.sqrt(area / 500)))
 
             roi = cloud_2d[v0:v1:stride, u0:u1:stride]
             pts = np.stack(
@@ -415,9 +399,9 @@ class ZEDWallDetector(Node):
                 axis=1)
             pts = pts[~np.isnan(pts).any(axis=1)]
 
-            if len(pts) < 100:
+            if len(pts) < 50:  # ← seuil abaissé de 100→50 pour petites bbox
                 self.get_logger().warn(
-                    f'[{label}] SKIP — {len(pts)} points valides (< 100)')
+                    f'[{label}] SKIP — {len(pts)} points valides (< 50)')
                 continue
 
             plane          = pyrsc.Plane()
@@ -435,21 +419,14 @@ class ZEDWallDetector(Node):
             if norm_n < 1e-9:
                 continue
 
-            # Normalisation → normale unitaire + d normalisé
-            # La distance d'un point P au plan = |n·P + d| (sans division car |n|=1)
             normal = np.array([a, b, c]) / norm_n
             d_norm = d / norm_n
-
             centroid = np.mean(pts[inliers], axis=0)
 
-            # Convention : normale pointe vers la caméra (dot(n, centroid) < 0)
             if np.dot(normal, centroid) > 0:
                 normal = -normal
                 d_norm = -d_norm
 
-            # ── Détection sol vs mur ──────────────────────────────────────
-            # Z=Up dans REP-103 : si la composante Z de la normale est grande,
-            # le plan est quasi-horizontal → sol (ou plafond).
             surface = 'floor' if abs(float(normal[2])) > FLOOR_NZ_THRESH else 'wall'
 
             frame_planes[uid] = {
@@ -464,14 +441,14 @@ class ZEDWallDetector(Node):
                 f'[{label}|{uid}] plan OK — surface={surface} '
                 f'n={normal.round(3).tolist()} '
                 f'centroïde={centroid.round(3).tolist()} '
-                f'inliers={len(inliers)}/{len(pts)} ({ratio:.0%})'
+                f'pts={len(pts)} inliers={len(inliers)} ({ratio:.0%})'
             )
 
         if not frame_planes:
             return
 
         # ══════════════════════════════════════════════════════════════════
-        # ÉTAPE 2 — Comparaison par paires (pour la visualisation RViz)
+        # ÉTAPE 2 — Comparaison par paires (visualisation RViz)
         # ══════════════════════════════════════════════════════════════════
         ids    = list(frame_planes.keys())
         colors = {uid: (1.0, 0.0, 0.0) for uid in ids}
@@ -507,7 +484,6 @@ class ZEDWallDetector(Node):
             normal   = data['model'][:3]
             surface  = data['surface']
 
-            # Hauteur
             if drone_altitude is not None:
                 height_m      = round(drone_altitude + float(centroid[2]), 3)
                 height_source = 'absolute'
@@ -518,24 +494,18 @@ class ZEDWallDetector(Node):
             marker_array.markers.append(
                 self._make_arrow(uid, data, colors[uid], cloud_msg.header))
 
-            # Filtrer : seules les cibles sont décrites
             if not is_target_label(label):
                 continue
 
             wall_normal = [round(float(n), 4) for n in normal]
-
-            # Trouver la meilleure référence
             ref_id, ref_data = self._find_reference(uid, data, frame_planes)
 
             if ref_id is not None:
-                local_coords = self._compute_local_coords(
-                    data, ref_data, centroid)
-
+                local_coords = self._compute_local_coords(data, ref_data, centroid)
                 self.get_logger().info(
                     f'[{label}|{uid}] surface={surface} '
                     f'→ réf [{ref_data["label"]}|{ref_id}] | '
-                    f'coords={local_coords} | '
-                    f'height_m={height_m:+.3f}m'
+                    f'coords={local_coords} | height_m={height_m:+.3f}m'
                 )
                 scene_targets.append({
                     'id':            uid,
@@ -563,10 +533,8 @@ class ZEDWallDetector(Node):
                     'height_source': height_source,
                 })
 
-        # ── Publication ───────────────────────────────────────────────────
         self.marker_pub.publish(marker_array)
 
-        # Mise à jour mémoire RViz (persistance 3s)
         for uid, data in frame_planes.items():
             self.plane_memory[uid] = {**data, 'time': current_time}
         self.plane_memory = {
@@ -589,7 +557,8 @@ class ZEDWallDetector(Node):
             self.scene_pub.publish(out)
             self.get_logger().info(
                 f'/aeac/internal/scene_description → '
-                f'{len(scene_targets)} cible(s)')
+                f'{len(scene_targets)} cible(s) | '
+                f'cloud_dt={frame.cloud_dt*1000:.0f}ms')
 
         gc.collect()
 
@@ -599,13 +568,6 @@ class ZEDWallDetector(Node):
 
     def _find_reference(self, target_id: int, target_data: dict,
                         frame_planes: dict):
-        """
-        Trouve la meilleure référence (fenêtre/porte) pour une cible.
-
-        Cible sur mur  → référence sur le MÊME plan (is_same_plane requis).
-        Cible au sol   → référence murale la plus proche en distance 3D,
-                         sans contrainte de coplanarité (sol ⊥ mur).
-        """
         surface    = target_data.get('surface', 'wall')
         best_id    = None
         best_data  = None
@@ -616,15 +578,11 @@ class ZEDWallDetector(Node):
                 continue
             if not is_reference_label(data['label']):
                 continue
-
             if surface == 'wall':
-                # Coplanarité obligatoire pour les cibles murales
                 if not is_same_plane(
                         target_data['model'], data['model'],
                         self.sim_thresh, self.dist_thresh):
                     continue
-
-            # Distance 3D entre centroïdes (critère de sélection commun)
             d = float(np.linalg.norm(
                 data['centroid'] - target_data['centroid']))
             if d < best_dist:
@@ -636,55 +594,24 @@ class ZEDWallDetector(Node):
 
     def _compute_local_coords(self, target_data: dict, ref_data: dict,
                                centroid: np.ndarray) -> dict:
-        """
-        Calcule les coordonnées locales de la cible par rapport à la référence.
-
-        Cible sur mur :
-          Utilise le repère local du plan de référence (R_ref).
-          x = droite sur le mur  (+droite face au mur depuis l'extérieur)
-          y = haut sur le mur    (+haut)
-          z = profondeur         (non utilisé pour la description)
-
-        Cible au sol :
-          x         = distance latérale le long du mur de référence
-                      Projection de delta sur X_local du mur (vecteur "droite").
-                      + = droite face au mur depuis l'extérieur
-          y         = Δ hauteur entre les deux centroïdes (quasi-nul)
-          z / dist_wall = distance perpendiculaire au plan du mur.
-                      Formule : |n_wall · centroïde_cible + d_wall|
-                      La normale étant unitaire (normalisée dans _process_frame),
-                      il n'y a pas besoin de diviser par sqrt(a²+b²+c²).
-        """
         surface = target_data.get('surface', 'wall')
         delta   = centroid - ref_data['centroid']
 
         if surface == 'wall':
-            # Repère local du plan de référence
             P = to_local_coords(ref_data['R'], ref_data['centroid'], centroid)
             return {
                 'x': round(float(P[0]), 3),
                 'y': round(float(P[1]), 3),
                 'z': round(float(P[2]), 3),
             }
-
-        else:  # floor
-            # Vecteur "droite" sur le mur de référence (colonne 0 de R_ref)
-            R_ref   = ref_data['R']
-            x_local = R_ref[:, 0]   # [X_local, Y_local, Z_local] en colonnes
-
-            # Distance latérale le long du mur
-            x_lat = float(np.dot(delta, x_local))
-
-            # Distance perpendiculaire au plan du mur
-            # = |n_wall · centroïde_cible + d_wall|
-            # La normale est unitaire → pas de division nécessaire
+        else:
+            R_ref     = ref_data['R']
+            x_local   = R_ref[:, 0]
+            x_lat     = float(np.dot(delta, x_local))
             n_wall    = ref_data['model'][:3]
             d_wall    = ref_data['model'][3]
             dist_wall = abs(float(np.dot(n_wall, centroid) + d_wall))
-
-            # Δ hauteur (Z=Up, quasi-nul pour une cible au sol)
-            delta_z = float(delta[2])
-
+            delta_z   = float(delta[2])
             return {
                 'x':         round(x_lat,    3),
                 'y':         round(delta_z,  3),
@@ -715,8 +642,19 @@ class ZEDWallDetector(Node):
 
 def main():
     rclpy.init()
-    rclpy.spin(ZEDWallDetector())
-    rclpy.shutdown()
+    node = ZEDWallDetector()
+
+    # MultiThreadedExecutor — les callbacks buffer tournent en parallèle du RANSAC
+    # Sans ça, is_processing=True bloque cloud_cb/image_cb → cloud_dt explose
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
