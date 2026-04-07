@@ -2,42 +2,33 @@
 """
 overlay_node.py — Overlay visuel synchronisé avec le pipeline AEAC
 
-CHANGEMENTS v3
-──────────────
-  - Suppression des flèches normales (peu lisibles, peu utiles visuellement)
-  - Layout compact : toutes les infos d'une cible dans un seul bloc à droite
-    de la bbox, plutôt qu'empilées au-dessus et en-dessous
-  - Badge label principal collé en haut de la bbox (plus petit, plus propre)
-  - Infos ZED compactées sur une ligne : "ZED 2.6 -1.3 0.8m"
-  - Normale affichée comme texte court "n[-0.92 +0.39]" (x,y seulement, z omis)
-    sous le bloc principal si place disponible
-  - Indicateur surface sol/mur : icône 🟥 (mur) ou 🔲 (sol) dans le badge
-  - HUD bas de frame inchangé
-  - Légende simplifiée (sans entrée normale)
+CHANGEMENTS vs version précédente
+──────────────────────────────────
+  1. QoS BEST_EFFORT pour les topics ZED image
+     → Matcher le wrapper pour éviter la non-réception silencieuse
+
+  2. Synchronisation sur now() timestamp
+     → system_transformation publie scene_description avec un timestamp
+        correspondant au moment de publication (now() de stereo_yolo).
+        L'overlay cherche l'image la plus proche de ce timestamp dans son buffer.
+
+  3. Buffer image maxlen=10 (10Hz pub_frame_rate → 1s d'historique)
+     → Suffisant pour absorber les délais du pipeline sans garder du périmé
+
+  4. IMG_MATCH_TOL augmentée à 0.3s
+     → La chaîne stereo_yolo (~200ms) + system_transformation (~100ms) = ~300ms
+        entre la capture de l'image et la publication de scene_description.
+        L'overlay doit trouver une image dans ce délai.
 
 TOPICS
 ──────
   Subscribe:
-    <image_topic>        /zed/zed_node/rgb/color/rect/image
-    <objects_topic>      /aeac/test/objects
-    <scene_desc_topic>   /aeac/internal/scene_description
-    <scene_text_topic>   /aeac/internal/scene_text
+    /aeac/internal/target_detected        ← ObjectsStamped (RELIABLE)
+    /aeac/internal/scene_description      ← JSON (RELIABLE)
+    /aeac/internal/scene_text             ← texte (RELIABLE)
   Publish:
-    /aeac/external/overlay_image   sensor_msgs/Image
-    /aeac/external/scene_frame     custom_interfaces/SceneFrame
-
-PARAMÈTRES ROS2
-───────────────
-  image_topic        str   /zed/zed_node/rgb/color/rect/image
-  objects_topic      str   /aeac/test/objects
-  scene_desc_topic   str   /aeac/internal/scene_description
-  scene_text_topic   str   /aeac/internal/scene_text
-  image_width        int   448
-  image_height       int   256
-  buffer_size        int   60
-  save_images        bool  true
-  save_dir           str   /tmp/aeac_overlay
-  max_saved          int   20
+    /aeac/external/overlay_image          ← Image annotée
+    /aeac/external/scene_frame            ← SceneFrame (si custom_interfaces dispo)
 """
 
 import rclpy
@@ -57,7 +48,6 @@ from cv_bridge import CvBridge
 from std_msgs.msg import String
 from sensor_msgs.msg import Image
 
-# ── Message custom ────────────────────────────────────────────────────────────
 CUSTOM_MSG_AVAILABLE = False
 try:
     from custom_interfaces.msg import SceneFrame
@@ -65,7 +55,6 @@ try:
 except ImportError:
     pass
 
-# ── zed_msgs ──────────────────────────────────────────────────────────────────
 ZED_MSGS_AVAILABLE = False
 try:
     from zed_msgs.msg import ObjectsStamped
@@ -78,35 +67,40 @@ except ImportError:
 # PALETTE & CONSTANTES
 # ══════════════════════════════════════════════════════════════════════════════
 
-# BGR
-C_TARGET    = (0,   200, 255)   # Orange vif   → cibles
-C_REFERENCE = (50,  230,  80)   # Vert vif     → références (porte/fenêtre)
-C_OTHER     = (150, 150, 150)   # Gris         → autres objets
-C_COORDS    = (120, 255, 120)   # Vert pâle    → coords locales / dist mur
-C_RAW       = (210, 170, 255)   # Mauve pâle   → position brute ZED
+C_TARGET    = (0,   200, 255)
+C_REFERENCE = (50,  230,  80)
+C_OTHER     = (150, 150, 150)
+C_COORDS    = (120, 255, 120)
+C_RAW       = (210, 170, 255)
 C_HUD_BG    = (10,   10,  10)
 C_HUD_TXT   = (220, 220, 220)
 C_WHITE     = (255, 255, 255)
 C_BLACK     = (  0,   0,   0)
-C_HEIGHT    = (0,   240, 200)   # Turquoise    → hauteur
+C_HEIGHT    = (0,   240, 200)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 REFERENCE_LABELS = {'window', 'door', 'fenetre', 'porte'}
 TARGET_LABELS = {
     'person', 'target', 'cible',
-    'red_target', 'blue_target', 'green_target', 'yellow_target', 'orange_target',
-    'red target', 'blue target', 'green target', 'yellow target', 'orange target',
-    'red_circle', 'blue_circle', 'green_circle', 'yellow_circle',
-    'red circle', 'blue circle', 'green circle', 'yellow circle',
-    'circle_red', 'circle_blue', 'circle_green', 'circle_yellow',
+    'red_target',   'green', 'yellow', 'red', 'blue',  'blue_target',    'green_target',
+    'yellow_target', 'orange_target',  'white_target',  'black_target',
+    'red target',    'blue target',    'green target',
+    'yellow target', 'orange target',  'white target',  'black target',
+    'red_circle',    'blue_circle',    'green_circle',
+    'yellow_circle', 'white_circle',   'black_circle',
+    'red circle',    'blue circle',    'green circle',
+    'yellow circle', 'white circle',   'black circle',
+    'circle_red',    'circle_blue',    'circle_green',
+    'circle_yellow', 'circle_white',   'circle_black',
 }
 
-IMG_MATCH_TOL = 0.15   # secondes
+
+IMG_MATCH_TOL = 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPERS GÉNÉRAUX
+# HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def stamp_to_sec(stamp) -> float:
@@ -126,7 +120,8 @@ def find_closest(buffer: deque, target_sec: float):
 
 def _label_color(label: str):
     lo = label.lower().replace('-', '_').replace(' ', '_')
-    if lo in {l.lower().replace(' ', '_').replace('-', '_') for l in TARGET_LABELS}:
+    tl = {l.lower().replace(' ', '_').replace('-', '_') for l in TARGET_LABELS}
+    if lo in tl:
         return C_TARGET
     if lo in REFERENCE_LABELS:
         return C_REFERENCE
@@ -134,18 +129,16 @@ def _label_color(label: str):
 
 
 def _scale_factors(img_w: int, img_h: int):
-    """Facteurs visuels calibrés sur 1280×720."""
     ref_diag = (1280**2 + 720**2) ** 0.5
-    img_diag = (img_w**2 + img_h**2) ** 0.5
+    img_diag = (img_w**2  + img_h**2)  ** 0.5
     s        = img_diag / ref_diag
-
     return {
-        'fs_lg':  max(0.50, round(0.68 * s, 2)),   # label principal
-        'fs_md':  max(0.40, round(0.52 * s, 2)),   # infos secondaires
-        'fs_sm':  max(0.35, round(0.42 * s, 2)),   # HUD / légende
-        'th_box': max(2,    int(3    * s)),
-        'th_txt': max(1,    int(1.5  * s)),
-        'pad':    max(4,    int(6    * s)),
+        'fs_lg':  max(0.38, round(0.48 * s, 2)),
+        'fs_md':  max(0.30, round(0.38 * s, 2)),
+        'fs_sm':  max(0.28, round(0.32 * s, 2)),
+        'th_box': max(1,    int(1.5    * s)),
+        'th_txt': max(1,    int(1.0  * s)),
+        'pad':    max(2,    int(4    * s)),
     }
 
 
@@ -154,12 +147,10 @@ def _scale_factors(img_w: int, img_h: int):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _draw_bbox(img, x1, y1, x2, y2, color, th):
-    """Rectangle + coins en L. Fond très léger."""
     ov = img.copy()
     cv2.rectangle(ov, (x1, y1), (x2, y2), color, -1)
     cv2.addWeighted(ov, 0.10, img, 0.90, 0, img)
     cv2.rectangle(img, (x1, y1), (x2, y2), color, th, cv2.LINE_AA)
-
     arm = max(10, min(24, (x2 - x1) // 4, (y2 - y1) // 4))
     for p1, mid, p2 in [
         ((x1, y1 + arm), (x1, y1),   (x1 + arm, y1)),
@@ -175,35 +166,23 @@ def _draw_bbox(img, x1, y1, x2, y2, color, th):
 
 def _badge(img, x, y, text: str, color, fs: float, th: int,
            bg_alpha: float = 0.85) -> int:
-    """
-    Texte sur fond opaque.
-    (x, y) = coin haut-gauche.
-    Retourne y_bottom.
-    """
     (tw, th_), base = cv2.getTextSize(text, FONT, fs, th)
     pad = max(3, int(5 * fs))
     rx1 = max(0, x - pad)
     ry1 = max(0, y - pad)
     rx2 = min(img.shape[1] - 1, x + tw + pad)
     ry2 = min(img.shape[0] - 1, y + th_ + base + pad)
-
     roi = img[ry1:ry2, rx1:rx2]
     if roi.size > 0:
         bg = np.full_like(roi, C_HUD_BG)
         cv2.addWeighted(bg, bg_alpha, roi, 1 - bg_alpha, 0, roi)
         img[ry1:ry2, rx1:rx2] = roi
-
     cv2.rectangle(img, (rx1, ry1), (rx2, ry2), color, 1)
     cv2.putText(img, text, (x, y + th_), FONT, fs, color, th, cv2.LINE_AA)
     return ry2
 
 
 def _info_block(img, x, y, lines: list, sc: dict) -> int:
-    """
-    Affiche une liste de (text, color) empilés verticalement.
-    x, y = coin haut-gauche du bloc.
-    Retourne y_bottom du bloc.
-    """
     y_cur = y
     for text, color in lines:
         y_cur = _badge(img, x, y_cur, text, color,
@@ -212,7 +191,6 @@ def _info_block(img, x, y, lines: list, sc: dict) -> int:
 
 
 def _draw_legend(img, sc: dict):
-    """Légende simplifiée — coin haut droit."""
     entries = [
         (C_TARGET,    'target'),
         (C_REFERENCE, 'reference (door/window)'),
@@ -220,27 +198,24 @@ def _draw_legend(img, sc: dict):
         (C_RAW,       'ZED 3D position'),
         (C_HEIGHT,    'height'),
     ]
-    fs     = sc['fs_sm']
-    th     = sc['th_txt']
-    pad    = 6
-    box_w  = max(12, int(16 * (sc['fs_sm'] / 0.4)))
-    lh     = max(18, int(cv2.getTextSize('A', FONT, fs, th)[0][1] * 2.3))
+    fs    = sc['fs_sm']
+    th    = sc['th_txt']
+    pad   = 6
+    box_w = max(12, int(16 * (sc['fs_sm'] / 0.4)))
+    lh    = max(18, int(cv2.getTextSize('A', FONT, fs, th)[0][1] * 2.3))
     max_tw = max(cv2.getTextSize(lbl, FONT, fs, th)[0][0] for _, lbl in entries)
     tw_tot = pad + box_w + 8 + max_tw + pad
     th_tot = len(entries) * lh + pad * 2
     margin = 10
-
     x0 = img.shape[1] - tw_tot - margin
     y0 = margin
-
     cv2.rectangle(img, (x0, y0), (x0 + tw_tot, y0 + th_tot), C_HUD_BG, -1)
     cv2.rectangle(img, (x0, y0), (x0 + tw_tot, y0 + th_tot), (90, 90, 90), 1)
-
     for i, (col, lbl) in enumerate(entries):
         yc = y0 + pad + i * lh + lh // 2
         cv2.rectangle(img,
-                      (x0 + pad,          yc - box_w // 2),
-                      (x0 + pad + box_w,  yc + box_w // 2),
+                      (x0 + pad,         yc - box_w // 2),
+                      (x0 + pad + box_w, yc + box_w // 2),
                       col, -1)
         cv2.putText(img, lbl,
                     (x0 + pad + box_w + 6, yc + int(box_w * 0.4)),
@@ -248,7 +223,6 @@ def _draw_legend(img, sc: dict):
 
 
 def _draw_hud(img, scene_json: dict, sc: dict):
-    """Bande d'info opaque en bas."""
     ts   = scene_json.get('timestamp', 0.0)
     c_dt = scene_json.get('cloud_dt', 0.0)
     i_dt = scene_json.get('image_dt')
@@ -265,7 +239,6 @@ def _draw_hud(img, scene_json: dict, sc: dict):
     th    = sc['th_txt']
     _, lh = cv2.getTextSize('A', FONT, fs, th)[0]
     band  = lh * 4 + 10
-
     cv2.rectangle(img, (0, h - band), (w, h), C_HUD_BG, -1)
     cv2.line(img, (0, h - band), (w, h - band), (70, 70, 70), 1)
     for i, line in enumerate(lines):
@@ -283,29 +256,13 @@ def draw_overlay(image_cv: np.ndarray,
                  objects_msg,
                  ref_img_w: int,
                  ref_img_h: int) -> np.ndarray:
-    """
-    Dessine l'overlay complet et retourne l'image annotée.
-
-    Layout par objet
-    ────────────────
-    Au-dessus de la bbox :
-      [label  conf%]          ← badge couleur de l'objet
-
-    À droite (ou en dessous si débord) — bloc compact :
-      [ZED x y z m]           ← position brute ZED, une ligne
-      [x.xm R  y.ym↑  [ref]] ← coords locales (mur) ou dist+latéral (sol)
-      [H=+x.xm ABS/REL]       ← hauteur
-
-    Pas de flèche normale (trop difficile à lire).
-    """
-    out    = image_cv.copy()
+    out      = image_cv.copy()
     h_img, w_img = out.shape[:2]
 
     scale_u = w_img / ref_img_w
     scale_v = h_img / ref_img_h
     sc      = _scale_factors(w_img, h_img)
 
-    # Index JSON par label
     targets_by_label: dict[str, list] = {}
     for t in scene_json.get('targets', []):
         targets_by_label.setdefault(t['label'].lower(), []).append(t)
@@ -316,7 +273,6 @@ def draw_overlay(image_cv: np.ndarray,
                not obj.bounding_box_2d.corners:
                 continue
 
-            # ── Géométrie bbox ─────────────────────────────────────────────
             us = [c.kp[0] * scale_u for c in obj.bounding_box_2d.corners]
             vs = [c.kp[1] * scale_v for c in obj.bounding_box_2d.corners]
             x1 = max(0,         int(min(us)))
@@ -330,31 +286,30 @@ def draw_overlay(image_cv: np.ndarray,
             color = _label_color(label)
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-            # ── Bbox + point central ───────────────────────────────────────
             _draw_bbox(out, x1, y1, x2, y2, color, sc['th_box'])
-            cv2.circle(out, (cx, cy), max(3, sc['th_box']),
-                       color, -1, cv2.LINE_AA)
 
-            # ── Badge label + confiance (au-dessus de la bbox) ────────────
-            conf      = getattr(obj, 'confidence', 0.0)
-            lbl_text  = f'{label}  {conf:.0f}%'
+
+            conf     = getattr(obj, 'confidence', 0.0)
+            lbl_text = f'{label}  {conf:.0f}%'
             (_, lh_), _ = cv2.getTextSize(lbl_text, FONT, sc['fs_lg'], sc['th_txt'])
             y_lbl = max(lh_ + 4, y1 - lh_ - 6)
             _badge(out, x1, y_lbl, lbl_text, color, sc['fs_lg'], sc['th_txt'])
 
-            # ── Bloc info compact ──────────────────────────────────────────
-            # Positionné à droite de la bbox si la place le permet,
-            # sinon en dessous.
             BLOCK_MARGIN = 6
-            bx = x2 + BLOCK_MARGIN   # tentative à droite
-
+            bx      = x2 + BLOCK_MARGIN
             lo      = label.lower()
-            jt_list = targets_by_label.get(lo, [])
-            best_t  = jt_list[0] if jt_list else None
 
-            info_lines = []  # liste de (text, color)
+            if lo not in targets_by_label:
+                best_t = None
+            elif len(targets_by_label[lo]) == 1:
+                best_t = targets_by_label[lo][0]
+            else:
+                # Pop le premier élément pour que le prochain objet du même label
+                # prenne la target suivante
+                best_t = targets_by_label[lo].pop(0)
 
-            # ── Ligne 1 : position brute ZED compactée ────────────────────
+            info_lines = []
+
             if hasattr(obj, 'position') and len(obj.position) >= 3:
                 px, py, pz = obj.position[0], obj.position[1], obj.position[2]
                 info_lines.append(
@@ -367,11 +322,9 @@ def draw_overlay(image_cv: np.ndarray,
                 h_m     = best_t.get('height_m')
                 h_src   = best_t.get('height_source', 'relative_cam')
 
-                # ── Ligne 2 : coords locales ──────────────────────────────
                 if coords and ref:
                     ref_lbl = ref['label']
                     if surface == 'floor':
-                        # Sol : dist_wall + latéral
                         dist_w = coords.get('dist_wall', coords.get('z', 0.0))
                         x_lat  = coords.get('x', 0.0)
                         x_dir  = 'R' if x_lat >= 0 else 'L'
@@ -381,7 +334,6 @@ def draw_overlay(image_cv: np.ndarray,
                             C_COORDS
                         ))
                     else:
-                        # Mur : droite/gauche + haut/bas
                         xm = coords.get('x', 0.0)
                         ym = coords.get('y', 0.0)
                         xd = 'R' if xm >= 0 else 'L'
@@ -395,7 +347,6 @@ def draw_overlay(image_cv: np.ndarray,
                             for l in TARGET_LABELS}:
                     info_lines.append(('no ref', C_OTHER))
 
-                # ── Ligne 3 : hauteur ─────────────────────────────────────
                 if h_m is not None:
                     tag = 'ABS' if h_src == 'absolute' else 'REL'
                     info_lines.append((f'H {h_m:+.2f}m {tag}', C_HEIGHT))
@@ -403,20 +354,18 @@ def draw_overlay(image_cv: np.ndarray,
             if not info_lines:
                 continue
 
-            # Vérifier si le bloc tient à droite de l'image
             max_tw = max(
                 cv2.getTextSize(t, FONT, sc['fs_md'], sc['th_txt'])[0][0]
                 for t, _ in info_lines
             )
             if bx + max_tw + sc['pad'] * 2 > w_img:
-                bx = max(0, x1)   # rabat en dessous-gauche
+                bx = max(0, x1)
                 by = y2 + BLOCK_MARGIN
             else:
-                by = y1           # aligne en haut avec la bbox
+                by = y1
 
             _info_block(out, bx, by, info_lines, sc)
 
-    # ── HUD + légende ──────────────────────────────────────────────────────
     _draw_hud(out, scene_json, sc)
     _draw_legend(out, sc)
 
@@ -432,14 +381,13 @@ class OverlayNode(Node):
     def __init__(self):
         super().__init__('overlay_node')
 
-        # ── Paramètres ────────────────────────────────────────────────────
-        self.declare_parameter('image_topic',      '/zed/zed_node/rgb/color/rect/image')
-        self.declare_parameter('objects_topic',    '/aeac/test/objects')
+        self.declare_parameter('image_topic',      '/zed/zed_node/left/color/rect/image')
+        self.declare_parameter('objects_topic',    '/aeac/internal/target_detected')
         self.declare_parameter('scene_desc_topic', '/aeac/internal/scene_description')
         self.declare_parameter('scene_text_topic', '/aeac/internal/scene_text')
-        self.declare_parameter('image_width',      448)
-        self.declare_parameter('image_height',     256)
-        self.declare_parameter('buffer_size',       60)
+        self.declare_parameter('image_width',      1280)
+        self.declare_parameter('image_height',     720)
+        self.declare_parameter('buffer_size',       10)
         self.declare_parameter('save_images',      True)
         self.declare_parameter('save_dir',         '/tmp/aeac_overlay')
         self.declare_parameter('max_saved',         20)
@@ -455,42 +403,47 @@ class OverlayNode(Node):
         self.save_dir    = Path(self.get_parameter('save_dir').value)
         self.max_saved   = self.get_parameter('max_saved').value
 
-        # ── État ──────────────────────────────────────────────────────────
-        self.bridge          = CvBridge()
-        self.image_buffer    = deque(maxlen=self.buf_size)
-        self.objects_buffer  = deque(maxlen=self.buf_size)
+        self.bridge         = CvBridge()
+        # Buffer image : maxlen=10 → 1s à 10Hz
+        self.image_buffer   = deque(maxlen=50)
+        self.objects_buffer = deque(maxlen=10)
         self.last_scene_text = ''
-        self.cnt_frames      = 0
-        self.cnt_no_img      = 0
+        self.cnt_frames = self.cnt_no_img = 0
 
         if self.do_save:
             self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── QoS ───────────────────────────────────────────────────────────
-        qos = QoSProfile(
+        # QoS BEST_EFFORT pour les topics ZED
+        zed_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=5
+        )
+        reliable_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=5
         )
 
-        # ── Subscriptions ─────────────────────────────────────────────────
-        self.create_subscription(Image, image_topic,
-                                 self._image_cb, qos)
+        self.create_subscription(
+            Image, image_topic, self._image_cb, zed_qos)
 
+        # Objets stereo_yolo → RELIABLE
         if ZED_MSGS_AVAILABLE:
-            self.create_subscription(ObjectsStamped, objects_topic,
-                                     self._objects_cb, qos)
-            self.get_logger().info(f'Objects → {objects_topic}')
+            self.create_subscription(
+                ObjectsStamped, objects_topic,
+                self._objects_cb, reliable_qos)
         else:
             self.get_logger().warn('zed_msgs non disponible — bbox désactivées')
 
-        self.create_subscription(String, scene_desc_topic,
-                                 self._scene_cb, qos)
-        self.create_subscription(String, scene_text_topic,
-                                 self._text_cb, qos)
+        # Topics internes → RELIABLE
+        self.create_subscription(
+            String, scene_desc_topic, self._scene_cb, reliable_qos)
+        self.create_subscription(
+            String, scene_text_topic, self._text_cb,  reliable_qos)
 
-        # ── Publishers ────────────────────────────────────────────────────
         self.overlay_pub = self.create_publisher(
             Image, '/aeac/external/overlay_image', 5)
 
@@ -499,25 +452,17 @@ class OverlayNode(Node):
                 SceneFrame, '/aeac/external/scene_frame', 5)
         else:
             self.scene_frame_pub = None
-            self.get_logger().warn(
-                'custom_interfaces/SceneFrame non compilé → '
-                '/aeac/external/scene_frame désactivé')
 
         self.create_timer(10.0, self._log_stats)
 
         self.get_logger().info(
             f'OverlayNode démarré\n'
-            f'  image      : {image_topic}\n'
+            f'  image      : {image_topic} (BEST_EFFORT)\n'
             f'  objects    : {objects_topic}\n'
-            f'  scene_desc : {scene_desc_topic}\n'
-            f'  scene_text : {scene_text_topic}\n'
             f'  bbox_ref   : {self.ref_w}×{self.ref_h}\n'
-            f'  SceneFrame : {"OK" if CUSTOM_MSG_AVAILABLE else "DÉSACTIVÉ"}\n'
-            f'  save       : {self.do_save}  '
-            f'dir={self.save_dir}  max={self.max_saved}'
+            f'  IMG_MATCH_TOL : {IMG_MATCH_TOL*1000:.0f}ms\n'
+            f'  SceneFrame : {"OK" if CUSTOM_MSG_AVAILABLE else "DÉSACTIVÉ"}'
         )
-
-    # ── Buffers ───────────────────────────────────────────────────────────────
 
     def _image_cb(self, msg: Image):
         self.image_buffer.append((stamp_to_sec(msg.header.stamp), msg))
@@ -528,8 +473,6 @@ class OverlayNode(Node):
     def _text_cb(self, msg: String):
         self.last_scene_text = msg.data
 
-    # ── Déclencheur ───────────────────────────────────────────────────────────
-
     def _scene_cb(self, msg: String):
         try:
             scene_json = json.loads(msg.data)
@@ -539,22 +482,24 @@ class OverlayNode(Node):
 
         ts_scene    = scene_json.get('timestamp', 0.0)
         image_stamp = scene_json.get('image_stamp')
-        sync_target = image_stamp if image_stamp is not None else ts_scene
-        sync_mode   = 'image_stamp' if image_stamp else 'timestamp(fallback)'
 
+        sync_target = image_stamp if image_stamp is not None else ts_scene
+        sync_mode   = 'image_stamp' if image_stamp is not None else 'ts_scene'
+        
         image_msg, img_diff = find_closest(self.image_buffer, sync_target)
         if image_msg is None or img_diff > IMG_MATCH_TOL:
             self.cnt_no_img += 1
             self.get_logger().warn(
-                f'Image non trouvée (sync={sync_mode}, '
-                f'diff={img_diff * 1000:.0f}ms)')
+                f'Image non trouvée (mode={sync_mode} '
+                f'target={sync_target:.3f} '
+                f'diff={img_diff*1000:.0f}ms > {IMG_MATCH_TOL*1000:.0f}ms  '
+                f'buf={len(self.image_buffer)})',
+                throttle_duration_sec=2.0)
             return
 
         objects_msg, obj_diff = find_closest(self.objects_buffer, ts_scene)
         if obj_diff > 0.5:
             objects_msg = None
-            self.get_logger().warn(
-                f'Objets désynchronisés ({obj_diff * 1000:.0f}ms)')
 
         try:
             image_cv = self.bridge.imgmsg_to_cv2(
@@ -563,12 +508,11 @@ class OverlayNode(Node):
             self.get_logger().error(f'CvBridge: {e}')
             return
 
-        annotated = draw_overlay(image_cv, scene_json, objects_msg,
-                                 self.ref_w, self.ref_h)
+        annotated = draw_overlay(
+            image_cv, scene_json, objects_msg, self.ref_w, self.ref_h)
 
         try:
-            overlay_ros        = self.bridge.cv2_to_imgmsg(
-                annotated, encoding='bgr8')
+            overlay_ros        = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
             overlay_ros.header = image_msg.header
         except Exception as e:
             self.get_logger().error(f'cv2_to_imgmsg: {e}')
@@ -592,21 +536,17 @@ class OverlayNode(Node):
 
         self.cnt_frames += 1
         self.get_logger().info(
-            f'Overlay #{self.cnt_frames} | {sync_mode} | '
-            f'img_diff={img_diff * 1000:.1f}ms | '
-            f'{"avec bbox" if objects_msg else "sans bbox"}')
-
-    # ── Sauvegarde ────────────────────────────────────────────────────────────
+            f'Overlay #{self.cnt_frames} | diff={img_diff*1000:.1f}ms | '
+            f'{"avec bbox" if objects_msg else "sans bbox"}',
+            throttle_duration_sec=1.0)
 
     def _save(self, img: np.ndarray, ts: float, scene_json: dict):
-        """Sauvegarde image + .txt avec wall-clock timestamp pour éviter
-        les doublons lors des boucles de rosbag."""
         ts_ms    = int(time.time() * 1000)
         stem     = f'aeac_{ts_ms:015d}'
         img_path = self.save_dir / f'{stem}.jpg'
         txt_path = self.save_dir / f'{stem}.txt'
 
-        cv2.imwrite(str(img_path), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        cv2.imwrite(str(img_path), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
         targets = scene_json.get('targets', [])
         lines   = [
@@ -624,8 +564,7 @@ class OverlayNode(Node):
             ref     = t.get('reference')
             surface = t.get('surface', 'wall')
             coords  = t.get('local_coords')
-            lines.append(f'── Target [{i+1}]  ({surface}) '
-                         + '─' * 30)
+            lines.append(f'── Target [{i+1}]  ({surface}) ' + '─' * 30)
             lines.append(f'  label     : {t.get("label", "?")}')
             lines.append(f'  height    : {t.get("height_m", 0.0):+.3f}m '
                          f'({"ABS" if t.get("height_source") == "absolute" else "REL"})')
@@ -646,21 +585,14 @@ class OverlayNode(Node):
         if self.last_scene_text:
             lines += ['═' * 60, 'SCENE DESCRIPTION', '═' * 60,
                       self.last_scene_text, '']
-        else:
-            lines += ['═' * 60,
-                      'SCENE DESCRIPTION : (pas encore reçue)',
-                      '═' * 60, '']
 
         txt_path.write_text('\n'.join(lines), encoding='utf-8')
 
-        # Rotation
         existing = sorted(self.save_dir.glob('aeac_*.jpg'))
         while len(existing) > self.max_saved:
             old = existing.pop(0)
             old.unlink(missing_ok=True)
             old.with_suffix('.txt').unlink(missing_ok=True)
-
-    # ── Stats ─────────────────────────────────────────────────────────────────
 
     def _log_stats(self):
         self.get_logger().info(

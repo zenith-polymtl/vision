@@ -1,116 +1,61 @@
-#!/usr/bin/env python3
-"""
-test_publisher.py — Injecteur de fausses détections pour tester wall_detector
-
-PRINCIPE
-────────
-Publie sur /aeac/test/objects avec le timestamp copié du point cloud du rosbag.
-C'est la garantie que wall_detector trouvera toujours le bon cloud dans son
-buffer (décalage ~0ms), sans dépendre de use_sim_time ou --clock.
-
-UTILISATION
-───────────
-  1. Lance le rosbag normalement :
-       ros2 bag play /aeac/data/rosbag2_2026_02_03-22_19_30 --loop
-
-  2. Dans wall_detector.py, la subscription ObjectsStamped doit pointer vers :
-       '/aeac/test/objects'
-
-  3. Lance wall_detector, puis ce noeud (pas besoin de use_sim_time) :
-       ros2 run <package> wall_detector
-       ros2 run <package> test_publisher
-
-CONFIGURATION
-─────────────
-Ajuste les bbox en pixels avec rqt_image_view :
-  ros2 run rqt_image_view rqt_image_view
-  → topic : /zed/zed_node/rgb/color/rect/image
-"""
-
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
-from sensor_msgs.msg import PointCloud2
-from zed_msgs.msg import ObjectsStamped, Object, Keypoint2Di
+from rclpy.qos import (QoSProfile, QoSReliabilityPolicy,
+                        QoSHistoryPolicy, QoSDurabilityPolicy)
+from std_msgs.msg import Float64
+from geometry_msgs.msg import PoseStamped
 
 
-OUTPUT_TOPIC = '/aeac/test/objects'
+class FakeMavrosNode(Node):
 
-FAKE_OBJECTS = [
-    {'label': 'window', 'id': 1, 'bbox': (80, 46,  135, 112)},
-    {'label': 'door', 'id': 3, 'bbox': (220, 30,  285, 80)},  # 380*0.35, 130*0.355...
-    {'label': 'blue target', 'id': 2, 'bbox': (326, 20,  396, 80)},  # 932*0.35, 120*0.355...
-    {'label': 'yellow target', 'id': 4, 'bbox': (80, 35,  135, 90)},  # 932*0.35, 120*0.355...
-]
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def make_bbox(u_min, v_min, u_max, v_max):
-    corners = []
-    for u, v in [(u_min, v_min), (u_max, v_min), (u_max, v_max), (u_min, v_max)]:
-        kp = Keypoint2Di()
-        kp.kp = [u, v]
-        corners.append(kp)
-    return corners
-
-
-class TestPublisher(Node):
     def __init__(self):
-        super().__init__('test_publisher')
+        super().__init__('fake_mavros_node')
+
+        self.declare_parameter('heading_deg', 0.0)   # cap en degrés
+        self.declare_parameter('altitude_m',  6.0)   # hauteur en mètres
+        self.declare_parameter('pub_rate_hz', 10.0)  # fréquence de publication
+
+        self.heading  = self.get_parameter('heading_deg').value
+        self.altitude = self.get_parameter('altitude_m').value
+        rate          = self.get_parameter('pub_rate_hz').value
 
         qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=5
         )
 
-        self.pub          = self.create_publisher(ObjectsStamped, OUTPUT_TOPIC, qos)
-        self.latest_stamp = None
+        self.hdg_pub  = self.create_publisher(
+            Float64, '/mavros/global_position/compass_hdg', qos)
+        self.pose_pub = self.create_publisher(
+            PoseStamped, '/mavros/local_position/pose', qos)
 
-        # On s'abonne au cloud UNIQUEMENT pour copier son timestamp.
-        # Dès qu'un cloud arrive, on publie immédiatement les fausses détections
-        # avec le même stamp → décalage garanti ~0ms dans wall_detector.
-        self.create_subscription(
-            PointCloud2,
-            '/zed/zed_node/point_cloud/cloud_registered',
-            self.cloud_cb,
-            qos
-        )
+        self.create_timer(1.0 / rate, self._publish)
 
         self.get_logger().info(
-            f'Test publisher démarré → {OUTPUT_TOPIC}\n'
-            + '\n'.join(f'  [{o["id"]}] {o["label"]} bbox={o["bbox"]}' for o in FAKE_OBJECTS)
+            f'FakeMavros démarré — '
+            f'heading={self.heading}°  altitude={self.altitude}m  '
+            f'rate={rate}Hz'
         )
 
-    def cloud_cb(self, msg):
-        """
-        Appelé à chaque nouveau cloud. On publie immédiatement avec le même
-        timestamp → la détection et le cloud sont parfaitement synchronisés.
-        On publie ici plutôt que dans un timer pour coller exactement au rythme
-        du rosbag sans timer drift.
-        """
-        out = ObjectsStamped()
-        out.header.stamp    = msg.header.stamp   # même stamp que le cloud
-        out.header.frame_id = 'zed_left_camera_frame'
+    def _publish(self):
+        now = self.get_clock().now().to_msg()
 
-        for cfg in FAKE_OBJECTS:
-            obj            = Object()
-            obj.label_id   = cfg['id']
-            obj.label      = cfg['label']
-            obj.confidence = 99.0
-            obj.position   = [0.0, 0.0, 1.0]
+        hdg_msg      = Float64()
+        hdg_msg.data = self.heading
+        self.hdg_pub.publish(hdg_msg)
 
-            u_min, v_min, u_max, v_max  = cfg['bbox']
-            obj.bounding_box_2d.corners = make_bbox(u_min, v_min, u_max, v_max)
-            out.objects.append(obj)
-
-        self.pub.publish(out)
+        pose_msg                    = PoseStamped()
+        pose_msg.header.stamp       = now
+        pose_msg.header.frame_id    = 'map'
+        pose_msg.pose.position.z    = self.altitude
+        self.pose_pub.publish(pose_msg)
 
 
-def main():
-    rclpy.init()
-    rclpy.spin(TestPublisher())
+def main(args=None):
+    rclpy.init(args=args)
+    rclpy.spin(FakeMavrosNode())
     rclpy.shutdown()
 
 
