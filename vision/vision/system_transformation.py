@@ -59,11 +59,11 @@ from std_msgs.msg import Float64, String
 
 # ── LABELS ────────────────────────────────────────────────────────────────────
 
-REFERENCE_LABELS = {'window', 'door', 'fenetre', 'porte'}
+REFERENCE_LABELS = {"window","house door","windows","door","garage door","glass","glass door","reflecting window","door","blue door","white window","small white window"}
 
 TARGET_LABELS = {
     'person', 'target', 'cible',
-    'red_target',    'green', 'yellow', 'red', 'blue',  'blue_target',    'green_target',
+    'red_target',    'green', 'yellow', 'red', 'blue', 'black'  'blue_target',    'green_target',
     'yellow_target', 'orange_target',  'white_target',  'black_target',
     'red target',    'blue target',    'green target',
     'yellow target', 'orange target',  'white target',  'black target',
@@ -166,14 +166,14 @@ class ZEDWallDetector(Node):
 
         # ── Paramètres ────────────────────────────────────────────────────
         self.declare_parameter('ransac_dist',        0.03)
-        self.declare_parameter('ransac_iterations',  80)
+        self.declare_parameter('ransac_iterations',  40)
         self.declare_parameter('min_inlier_ratio',   0.35)
         self.declare_parameter('padding_ratio',      0.40)
         # sync_tolerance : avec cloud à 5Hz (200ms période) + YOLO ~200ms latence
         # → le cloud le plus proche est typiquement à 0-200ms du timestamp objet.
         # On met 0.5s pour absorber les pics sans matcher des clouds vieux de 3s.
-        self.declare_parameter('sync_tolerance',     2.0)
-        self.declare_parameter('image_tolerance',    2.0)
+        self.declare_parameter('sync_tolerance',     20.0)
+        self.declare_parameter('image_tolerance',    20.0)
         # buffer_size overlay : gardé grand pour l'overlay node
         self.declare_parameter('buffer_size',        60)
         self.declare_parameter('camera_pitch_deg',   0.0)
@@ -181,8 +181,8 @@ class ZEDWallDetector(Node):
         self.declare_parameter('plane_dist_thresh',  0.35)
         # Résolution réelle publiée par le ZED wrapper après downscale
         # grab_resolution=720 + pub_downscale_factor=2.0 → 640×360
-        self.declare_parameter('image_width',        1280)
-        self.declare_parameter('image_height',       720)
+        self.declare_parameter('image_width',        1280) #sur zed mini 336
+        self.declare_parameter('image_height',       720)# sur zed mini 188
         self.declare_parameter('objects_topic',      '/aeac/internal/target_detected')
         # Rate limiter : avec cloud à 5Hz, on traite max 1 frame toutes les 0.5s
         # → le RANSAC (~50-100ms sur 500pts) finit largement avant la prochaine
@@ -245,7 +245,7 @@ class ZEDWallDetector(Node):
         # ZED topics → BEST_EFFORT pour matcher le QoS du wrapper
         self.create_subscription(
             PointCloud2,
-            '/zed/zed_node/point_cloud/cloud_registered',
+            '/points_throttled', #'/zed/zed_node/point_cloud/cloud_registered',
             self.cloud_cb, reliable_qos)
 
 
