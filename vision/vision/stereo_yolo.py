@@ -128,6 +128,9 @@ class StereoYOLONode(Node):
             self.get_logger().warn("Triggered, but waiting for CameraInfo...")
             return
 
+        objs_stamped_msg = ObjectsStamped()
+        objs_stamped_msg.objects = []
+        
         try:
             # Reset trigger immediately so we only run once per command
             self.trigger_requested = False
@@ -147,8 +150,6 @@ class StereoYOLONode(Node):
 
             annotated_L = img_L.copy()
             detection_saved = False
-            objs_stamped_msg = ObjectsStamped()
-            objs_stamped_msg.objects = []
             
             for box_L in boxes_L:
                 x1_L, y1_L, x2_L, y2_L, conf_L, cls_L = box_L
@@ -186,23 +187,18 @@ class StereoYOLONode(Node):
                         objs_stamped_msg.objects.append(obj_msg)
                         detection_saved = True
             
+            self.objects_stamped_pub.publish(objs_stamped_msg) 
             if detection_saved:
-                self.objects_stamped_pub.publish(objs_stamped_msg)
-                self.get_logger().info("Detection successful and published.")
                 ui_msg = UiMessage()
                 ui_msg.message = f"Objects Detected. First one is {objs_stamped_msg.objects[0].label}"
                 ui_msg.is_success = True
                 self.ui_message_pub.publish(ui_msg)
             else:
                 self.get_logger().info("Triggered, but no objects found in this frame.")
-                req = Bool()
-                req.data = False
                 ui_msg = UiMessage()
                 ui_msg.message = f"No object detected. Canceling auto aproach"
                 ui_msg.is_success = False
                 self.ui_message_pub.publish(ui_msg)
-
-                self.auto_approach_pub.publish(req)
 
         except Exception as e:
             self.get_logger().error(f"Error in stereo sync_callback: {e}")
