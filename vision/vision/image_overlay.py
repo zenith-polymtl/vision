@@ -79,7 +79,7 @@ TARGET_LABELS = {
     'circle_yellow', 'circle_white',   'circle_black',
 }
 
-IMG_MATCH_TOL = 50
+IMG_MATCH_TOL = 2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -536,7 +536,7 @@ class OverlayNode(Node):
         self.bridge         = CvBridge()
         self.image_buffer   = deque(maxlen=50)
         self.objects_buffer = deque(maxlen=10)
-        self.last_scene_text = ''
+        self.scene_text_buffer = deque(maxlen=20)
         self.cnt_frames = self.cnt_no_img = 0
 
         if self.do_save:
@@ -591,7 +591,19 @@ class OverlayNode(Node):
         self.objects_buffer.append((stamp_to_sec(msg.header.stamp), msg))
 
     def _text_cb(self, msg: String):
-        self.last_scene_text = msg.data
+        data = msg.data
+        ts = None
+        if data.startswith('TS:'):
+            first_line, rest = data.split('\n', 1)
+            try:
+                ts = float(first_line[3:])
+                data = rest  # le texte sans le préfixe
+            except ValueError:
+                pass
+        if ts is None:
+            # fallback si pas de timestamp
+            ts = self.get_clock().now().nanoseconds * 1e-9
+        self.scene_text_buffer.append((ts, data))
 
     def _scene_cb(self, msg: String):
         try:
@@ -638,6 +650,9 @@ class OverlayNode(Node):
             self.get_logger().error(f'cv2_to_imgmsg: {e}')
             return
 
+        scene_text_msg, scene_text_dt = find_closest(self.scene_text_buffer, ts_scene)
+        scene_text = scene_text_msg if scene_text_dt < 1.0 else ''
+
         self.overlay_pub.publish(overlay_ros)
 
         if CUSTOM_MSG_AVAILABLE and self.scene_frame_pub is not None:
@@ -645,14 +660,15 @@ class OverlayNode(Node):
                 sf               = SceneFrame()
                 sf.header        = image_msg.header
                 sf.scene_json    = msg.data
-                sf.scene_text    = self.last_scene_text
+                sf.scene_text = scene_text
                 sf.overlay_image = overlay_ros
                 self.scene_frame_pub.publish(sf)
             except Exception as e:
                 self.get_logger().error(f'Publish SceneFrame: {e}')
 
+       
         if self.do_save:
-            self._save(annotated, ts_scene, scene_json)
+            self._save(annotated, ts_scene, scene_json, scene_text)
 
         self.cnt_frames += 1
         self.get_logger().info(
@@ -660,7 +676,7 @@ class OverlayNode(Node):
             f'{"avec bbox" if objects_msg else "sans bbox"}',
             throttle_duration_sec=1.0)
 
-    def _save(self, img: np.ndarray, ts: float, scene_json: dict):
+    def _save(self, img: np.ndarray, ts: float, scene_json: dict, scene_text=''):
         ts_ms    = int(time.time() * 1000)
         stem     = f'aeac_{ts_ms:015d}'
         img_path = self.save_dir / f'{stem}.jpg'
@@ -702,9 +718,9 @@ class OverlayNode(Node):
                     lines.append(f'  local_y   : {coords.get("y", 0.0):+.3f}m  (haut+)')
             lines.append('')
 
-        if self.last_scene_text:
+        if scene_text :
             lines += ['═' * 60, 'SCENE DESCRIPTION', '═' * 60,
-                      self.last_scene_text, '']
+                      scene_text , '']
 
         txt_path.write_text('\n'.join(lines), encoding='utf-8')
 

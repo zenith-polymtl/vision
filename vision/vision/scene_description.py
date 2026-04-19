@@ -220,6 +220,7 @@ class SceneDescriptorNode(Node):
     def _scene_cb(self, msg: String):
         try:
             data = json.loads(msg.data)
+            timestamp = data.get('timestamp', 0.0)
         except json.JSONDecodeError as e:
             self.get_logger().error(f'JSON invalide : {e}')
             return
@@ -241,7 +242,7 @@ class SceneDescriptorNode(Node):
             self.get_logger().info(f'[Target {i+1}] {desc}')
 
         out      = String()
-        out.data = '\n'.join(lines)
+        out.data = f'TS:{timestamp:.6f}\n' + '\n'.join(lines)
         self.pub.publish(out)
 
 

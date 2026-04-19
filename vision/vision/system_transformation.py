@@ -719,9 +719,9 @@ class ZEDWallDetector(Node):
         n = data['model'][:3]
         m.points = [
             Point(x=float(c[0]),            y=float(c[1]),            z=float(c[2])),
-            Point(x=float(c[0]+n[0]*0.5),  y=float(c[1]+n[1]*0.5),  z=float(c[2]+n[2]*0.5)),
+            Point(x=float(c[0]+n[0]*3),  y=float(c[1]+n[1]*3),  z=float(c[2]+n[2]*3)),
         ]
-        m.scale.x, m.scale.y, m.scale.z = 0.05, 0.1, 0.1
+        m.scale.x, m.scale.y, m.scale.z = 0.15, 0.3, 0.3
         m.color.r = color[0]
         m.color.g = color[1]
         m.color.b = color[2]
