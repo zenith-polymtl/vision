@@ -11,7 +11,17 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <depend>ament_index_python</depend>
+  <depend>builtin_interfaces</depend>
   <depend>cv_bridge</depend>
+  <depend>custom_interfaces</depend>
+  <depend>geometry_msgs</depend>
+  <depend>message_filters</depend>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>zed_msgs</depend>
 
   <export>
     <build_type>ament_python</build_type>

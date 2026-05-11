@@ -34,7 +34,7 @@ setup(
             'detect_circle = vision.detect_circle:main',
             'image_overlay = vision.image_overlay:main',
             'ransac_detector = vision.ransac_detector:main',
-            'fps_counter = vision_pipeline.fps_counter:main',
+            'fps_counter = vision.fps_counter:main',
         ],
     },
 )
