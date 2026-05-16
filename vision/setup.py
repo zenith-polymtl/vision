@@ -13,7 +13,6 @@ setup(
         ('share/' + package_name + '/models', ['models/best-medium.pt']),
         ('share/' + package_name + '/models', ['models/best_nano.engine']),
         ('share/' + package_name + '/models', ['models/best_nano.onnx']),
-        ('share/' + package_name + '/models', ['models/yolo_m_100_epoch.pt']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -39,6 +38,7 @@ setup(
             'ransac_detector = vision.ransac_detector:main',
             'fps_counter = vision.fps_counter:main',
             'tensorRt_yolo = vision.tensorRt_yolo:main',
+            'mission_1_stereo = vision.stereo_mission_1:main'
         ],
     },
 )
