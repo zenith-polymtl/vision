@@ -138,8 +138,8 @@ class YOLOSubscriber(Node):
         self.get_logger().info(f"Activation status changed: {state}")
 
     def gimbal_offset_callback(self, msg):
-        self.offset_x = msg.x
-        self.offset_y = msg.y
+        self.offset_x = -msg.x
+        self.offset_y = -msg.y
 
     def image_callback(self, msg):
         if not self.is_activated:
