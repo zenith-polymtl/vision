@@ -11,7 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/models', ['models/best-medium.pt']),
-        ('share/' + package_name + '/models', ['models/yolo_fp16.engine']),
+        ('share/' + package_name + '/models', ['models/best_nano.engine']),
         ('share/' + package_name + '/models', ['models/best_nano.onnx']),
         ('share/' + package_name + '/models', ['models/yolo_m_100_epoch.pt']),
     ],
@@ -38,6 +38,7 @@ setup(
             'image_overlay = vision.image_overlay:main',
             'ransac_detector = vision.ransac_detector:main',
             'fps_counter = vision.fps_counter:main',
+            'tensorRt_yolo = vision.tensorRt_yolo:main',
         ],
     },
 )
