@@ -10,6 +10,7 @@ import os
 from ultralytics import YOLO
 
 from std_msgs.msg import Bool
+from geometry_msgs.msg import Vector3
 from custom_interfaces.msg import AimError
 
 class YOLOSubscriber(Node):
@@ -21,11 +22,15 @@ class YOLOSubscriber(Node):
         self.declare_parameter('activation_topic', '/aeac/internal/auto_shoot/start_hr_aiming')
         self.declare_parameter('gimbal_error_topic', '/aeac/internal/gimbal/target_error')
         self.declare_parameter('model_name', 'best_nano.engine')
+        self.declare_parameter('initial_offset_x', 0.0)
+        self.declare_parameter('initial_offset_y', 0.0)
         self.declare_parameter('min_confidence', 0.8)
 
         # 2. Attributes
         self.bridge = CvBridge()
         self.is_activated = True
+        self.offset_x = self.get_parameter('initial_offset_x').value
+        self.offset_y = self.get_parameter('initial_offset_y').value
         self.last_log_time = self.get_clock().now() # Timer for 1s logging
         self.frame_count = 0
         
@@ -41,15 +46,20 @@ class YOLOSubscriber(Node):
         self.get_logger().info(f"YOLO Engine loaded. Classes: {self.model.names}")
 
         # 3. Topics
-        qos = rclpy.qos.QoSProfile(depth=1, reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
+        qos = rclpy.qos.QoSProfile(depth=1, reliability=rclpy.qos.ReliabilityPolicy.RELIABLE)
         
-        self.create_subscription(Image, self.get_parameter('image_topic').value, self.image_callback, qos)
-        self.create_subscription(Bool, self.get_parameter('activation_topic').value, self.activation_callback, qos)
-        self.error_publisher = self.create_publisher(AimError, self.get_parameter('gimbal_error_topic').value, qos)
+        self.create_subscription(Image, self.get_parameter('image_topic').value, self.image_callback, qos_profile=qos)
+        self.create_subscription(Bool, self.get_parameter('activation_topic').value, self.activation_callback, qos_profile=qos)
+        self.create_subscription(Vector3, '/aeac/external/gimbal_offset', self.gimbal_offset_callback, qos_profile=qos)
+        self.error_publisher = self.create_publisher(AimError, self.get_parameter('gimbal_error_topic').value, qos_profile=qos)
 
     def activation_callback(self, msg):
         self.is_activated = msg.data
         self.get_logger().info(f"Targeting System: {'ON' if self.is_activated else 'OFF'}")
+
+    def gimbal_offset_callback(self, msg):
+        self.offset_x = msg.x
+        self.offset_y = msg.y
 
     def image_callback(self, msg):
         if not self.is_activated:
@@ -70,7 +80,7 @@ class YOLOSubscriber(Node):
                 stream=True
             )
 
-            img_center = torch.tensor([w / 2, h / 2], device=self.device, dtype=torch.float16)
+            img_center = torch.tensor([w / 2 + self.offset_x, h / 2 - self.offset_y], device=self.device, dtype=torch.float16)
             
             error_pitch, error_yaw = 0.0, 0.0
             found_target = False
