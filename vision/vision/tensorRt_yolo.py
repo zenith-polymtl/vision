@@ -112,36 +112,45 @@ class YOLOSubscriber(Node):
                     error_pitch = -float(delta[1].item())
                     found_target = True
 
-            # --- 1-Second Log Logic ---
-            now = self.get_clock().now()
-            if (now - self.last_log_time).nanoseconds >= 1e9: # 1 second in nanoseconds
-                if current_frame_classes:
-                    self.get_logger().info(f"Detections: {', '.join(current_frame_classes)}")
-                else:
-                    self.get_logger().info("No targets detected.")
-                self.last_log_time = now
-            # Increment the frame counter
-            self.frame_count += 1
+            log = False
+            if log:
+                # --- 1-Second Log Logic ---
+                now = self.get_clock().now()
+                if (now - self.last_log_time).nanoseconds >= 1e9: # 1 second in nanoseconds
+                    if current_frame_classes:
+                        self.get_logger().info(f"Detections: {', '.join(current_frame_classes)}")
+                    else:
+                        self.get_logger().info("No targets detected.")
+                    self.last_log_time = now
+                # Increment the frame counter
+                self.frame_count += 1
 
-            # --- 1-Second Log & FPS Logic ---
-            now = self.get_clock().now()
-            elapsed_ns = (now - self.last_log_time).nanoseconds
-            
-            if elapsed_ns >= 1e9: # If 1 second has passed
-                elapsed_sec = elapsed_ns / 1e9
-                fps = self.frame_count / elapsed_sec
+                # --- 1-Second Log & FPS Logic ---
+                now = self.get_clock().now()
+                elapsed_ns = (now - self.last_log_time).nanoseconds
                 
-                # Format the log string
-                class_str = ', '.join(current_frame_classes) if current_frame_classes else "None"
-                self.get_logger().info(f"⚡ FPS: {fps:.1f} | Detections: {class_str}")
-                
-                # Reset timers and counters for the next second
-                self.last_log_time = now
-                self.frame_count = 0
+                if elapsed_ns >= 1e9: # If 1 second has passed
+                    elapsed_sec = elapsed_ns / 1e9
+                    fps = self.frame_count / elapsed_sec
+                    
+                    # Format the log string
+                    class_str = ', '.join(current_frame_classes) if current_frame_classes else "None"
+                    self.get_logger().info(f"⚡ FPS: {fps:.1f} | Detections: {class_str}")
+                    
+                    # Reset timers and counters for the next second
+                    self.last_log_time = now
+                    self.frame_count = 0
+                    
             if found_target:
                 msg_err = AimError()
                 msg_err.pitch_error = error_pitch
                 msg_err.yaw_error = error_yaw
+                self.error_publisher.publish(msg_err)
+            else:
+                # Publish zero error if no target found
+                msg_err = AimError()
+                msg_err.pitch_error = 0.0
+                msg_err.yaw_error = 0.0
                 self.error_publisher.publish(msg_err)
 
         except Exception as e:
