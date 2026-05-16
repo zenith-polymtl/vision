@@ -41,6 +41,7 @@ class StereoYOLONode(Node):
         self.cy = None
         
         qos_reliable = self._create_qos_profile(QoSReliabilityPolicy.RELIABLE)
+        qos_best_effort = self._create_qos_profile(QoSReliabilityPolicy.BEST_EFFORT)
 
         self.info_sub = self.create_subscription(
             CameraInfo,
@@ -49,9 +50,15 @@ class StereoYOLONode(Node):
             10
         )
         
+        self.objects_stamped_pub = self.create_publisher(
+            ObjectsStamped, 
+            '/aeac/internal/auto_approach/target_detected', 
+            10
+        )
+        
         self.ui_message_pub = self.create_publisher(
             UiMessage,
-            '/aeac/external/send_to_ui',
+            '/aeac/external/UI/display',
             qos_reliable
         )
 
@@ -59,7 +66,7 @@ class StereoYOLONode(Node):
         self.overlay_pub = self.create_publisher(
             CompressedImage,
             '/aeac/external/detection_overlay',
-            qos_reliable
+            qos_best_effort
         )
 
         # Load YOLO model
@@ -82,7 +89,7 @@ class StereoYOLONode(Node):
         )
         self.ts.registerCallback(self.sync_callback)
 
-        self.get_logger().info("Stereo YOLO Node Started. Waiting for trigger on /aeac/internal/describe_scene...")
+        self.get_logger().info("Stereo YOLO Node Started. Waiting for trigger on /aeac/external/describe_scene'...")
 
 
     @staticmethod
@@ -243,6 +250,8 @@ class StereoYOLONode(Node):
                             best_match = center_R
 
                 pos_3d = None
+                self.get_logger().info(f"best match: {best_match}")
+                self.get_logger().info(f"Triggered, center_L[0]: {center_L[0]}, center_L[1]: {center_L[1]}, best_match[0] {best_match[0]}, best_match[1] {best_match[1]}.")
                 if best_match:
                     pos_3d = self.calculate_3d_position(
                         center_L[0], center_L[1], best_match[0], best_match[1]
