@@ -66,7 +66,7 @@ class StereoYOLONode(Node):
         self.overlay_pub = self.create_publisher(
             CompressedImage,
             '/aeac/external/detection_overlay',
-            qos_best_effort
+            qos_reliable
         )
 
         # Load YOLO model
@@ -250,8 +250,6 @@ class StereoYOLONode(Node):
                             best_match = center_R
 
                 pos_3d = None
-                self.get_logger().info(f"best match: {best_match}")
-                self.get_logger().info(f"Triggered, center_L[0]: {center_L[0]}, center_L[1]: {center_L[1]}, best_match[0] {best_match[0]}, best_match[1] {best_match[1]}.")
                 if best_match:
                     pos_3d = self.calculate_3d_position(
                         center_L[0], center_L[1], best_match[0], best_match[1]
