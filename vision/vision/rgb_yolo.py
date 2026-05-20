@@ -83,10 +83,10 @@ class YOLOSubscriber(Node):
         self.declare_parameter('activation_topic', '/aeac/internal/auto_shoot/start_hr_aiming')
         self.declare_parameter('gimbal_error_topic', '/aeac/internal/gimbal/target_error')
         self.declare_parameter('image_save_dir',   '/vision_ws/Pictures/yolo_without_distances')
-        self.declare_parameter('model_name',       'yolo_m_100_epoch.pt')
+        self.declare_parameter('model_name',       'phase2_640.pt')
         self.declare_parameter('initial_offset_x', 0.0)
         self.declare_parameter('initial_offset_y', 0.0)
-        self.declare_parameter('min_confidence',   0.8)
+        self.declare_parameter('min_confidence',   0.7)
 
         gp = self.get_parameter
         self.image_topic         = gp('image_topic').value

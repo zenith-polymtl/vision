@@ -24,11 +24,11 @@ class YOLOSubscriber(Node):
         self.declare_parameter('model_name', 'best_nano.engine')
         self.declare_parameter('initial_offset_x', 0.0)
         self.declare_parameter('initial_offset_y', 0.0)
-        self.declare_parameter('min_confidence', 0.8)
+        self.declare_parameter('min_confidence', 0.60)
 
         # 2. Attributes
         self.bridge = CvBridge()
-        self.is_activated = True
+        self.is_activated = False
         self.offset_x = self.get_parameter('initial_offset_x').value
         self.offset_y = self.get_parameter('initial_offset_y').value
         self.last_log_time = self.get_clock().now() # Timer for 1s logging
